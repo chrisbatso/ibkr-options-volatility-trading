@@ -98,6 +98,7 @@ def start_environment(monkeypatch, tmp_path):
         "MARKET_HOLIDAYS": "",
         "EMAIL_NOTIFIER_ENABLED": "false",
         "SLACK_NOTIFIER_ENABLED": "false",
+        "TRADING_ENABLED": "false",
         "LONG_THRESHOLD": "0.02",
         "SHORT_THRESHOLD": "0.005",
         "UPDATE_TIMEOUT": "60",
@@ -218,6 +219,45 @@ def test_screen_fails_clearly(monkeypatch, tmp_path):
 
     assert result.exit_code == 1
     assert "Screen failed: network down" in result.output
+
+
+def test_start_leaves_order_placement_off_by_default(start_environment):
+    stocks, engines_run = start_environment
+
+    result = CliRunner().invoke(market_watcher_cli.cli, ["start", "--stocks", str(stocks)])
+
+    assert result.exit_code == 0, result.output
+    [engine] = engines_run
+    assert engine.notifiers == []
+    assert "Order placement disabled" in result.output
+
+
+def test_start_adds_the_trader_when_order_placement_is_enabled(start_environment, monkeypatch):
+    from market_watcher.trading import IBKRStraddleTrader
+
+    stocks, engines_run = start_environment
+    monkeypatch.setitem(context.config, "TRADING_ENABLED", "true")
+
+    result = CliRunner().invoke(market_watcher_cli.cli, ["start", "--stocks", str(stocks)])
+
+    assert result.exit_code == 0, result.output
+    [engine] = engines_run
+    [trader] = engine.notifiers
+    assert isinstance(trader, IBKRStraddleTrader)
+    assert trader.settings.enabled and not trader.settings.transmit and not trader.settings.allow_live
+    assert "Order placement ENABLED: staged in TWS; paper accounts only; long straddle" in result.output
+
+
+def test_start_closes_the_trader_on_exit(start_environment, monkeypatch):
+    stocks, _ = start_environment
+    monkeypatch.setitem(context.config, "TRADING_ENABLED", "true")
+    closed = []
+    monkeypatch.setattr(market_watcher_cli.IBKRStraddleTrader, "close", lambda self: closed.append(self))
+
+    result = CliRunner().invoke(market_watcher_cli.cli, ["start", "--stocks", str(stocks)])
+
+    assert result.exit_code == 0, result.output
+    assert len(closed) == 1
 
 
 def test_start_closes_the_market_data_provider_on_exit(start_environment, monkeypatch):

@@ -45,7 +45,7 @@ Upon getting alerted by the MarketWatcher bot, we `hand picked` into which long 
 
 ### Future improvements
 
-Daily P&L can now be read from IBKR TWS as well as from Yahoo Finance (see *Market data providers* below). The next step is to automate the whole process: first add support for placing orders on TWS, then implement the full algotrading strategy.
+Daily P&L can now be read from IBKR TWS as well as from Yahoo Finance (see *Market data providers* below). Order placement on TWS is available as an experimental, off-by-default feature (see *Automated order placement* below); the remaining step towards a fully automated strategy is position management (exits, sizing, risk).
 
 ## How to use MarketWatcher trading bot?
 
@@ -177,9 +177,23 @@ To read the daily P&L from Interactive Brokers instead of Yahoo Finance:
 1. Install the optional dependency: `pip install -e ".[ibkr]"` (the Docker image includes it). It uses [`ib_async`](https://github.com/ib-api-reloaded/ib_async), which speaks the TWS protocol itself, so IB's `ibapi` package is not needed.
 2. Run [Trader Workstation](https://www.interactivebrokers.com/en/index.php?f=14099#tws-software) or [IB Gateway](https://www.interactivebrokers.com/en/index.php?f=16457) and enable the API (`File -> Global Configuration -> API -> Settings`):
    - Enable ActiveX and Socket Clients
-   - Read-Only API (MarketWatcher only reads market data and connects in read-only mode)
+   - Read-Only API: keep it enabled unless you turn on *Automated order placement* (below), which needs it off
    - Socket port: 7497 (TWS paper) / 7496 (TWS live) / 4002 (IB Gateway paper) / 4001 (IB Gateway live)
    - Allow connections from localhost only, unless MarketWatcher runs in Docker (see *Running in Docker*)
 3. Set `MARKET_DATA_PROVIDER=ibkr` and the `IBKR_*` settings in `.env`.
 
 The bot takes one market data snapshot per target stock and computes the daily change as `(price - previous close) / previous close`, using the last trade or, before the first trade of the day, the bid/ask midpoint. Without a market data subscription IB serves delayed (15-20 minute) data: `IBKR_MARKET_DATA_TYPE=3` (the default) accepts that, `1` insists on live data. Tickers IB cannot resolve as US stocks are skipped with a warning.
+
+### Automated order placement (experimental)
+
+With `TRADING_ENABLED=true`, every new opportunity also becomes an order on Interactive Brokers: an at-the-money straddle on the nearest expiry at least `STRADDLE_MIN_DAYS_TO_EXPIRY` days out, placed as a single combo limit order (so both legs fill together) at the net mid price plus or minus `STRADDLE_LIMIT_BUFFER_PCT` - bought for a long straddle, sold for a short straddle. The trader receives exactly what Slack and email receive, so it acts on threshold crossings only.
+
+The defaults are deliberately cautious, and every one of them is a setting in `.env`:
+
+- orders are **staged in TWS, not transmitted** (`IBKR_TRANSMIT_ORDERS=false`): they appear in TWS and you click Transmit, which keeps the hand-picking of the original workflow;
+- **paper accounts only** (`TRADING_ALLOW_LIVE=false`): every account id must start with `DU`;
+- **long straddles only** (`TRADING_STRATEGIES=long straddle`): short straddles are naked options with unlimited risk and need margin approval;
+- one contract per order; at most `STRADDLE_MAX_PREMIUM` (default $1,000) paid for a long straddle and `STRADDLE_MAX_NOTIONAL` (default $20,000) of underlying for a short one; at most `TRADING_MAX_ORDERS_PER_DAY` (default 3) new positions a day and one per ticker;
+- `TRADING_DRY_RUN=true` builds and logs the orders without sending anything - start there.
+
+Requirements: the `ibkr` extra (`pip install -e ".[ibkr]"`), options trading permissions on the account, the TWS **Read-Only API** setting turned off (the trader uses its own connection, `IBKR_TRADING_CLIENT_ID`), and option market data (delayed is fine for paper trading). This feature has only been tested against a simulated TWS: run it in dry-run mode, then staged mode, on a paper account before anything else.

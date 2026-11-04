@@ -96,7 +96,7 @@ class IBKRProvider(MarketDataProvider):
         if contracts:
             snapshots = ib.reqTickers(*contracts.values())
             for ticker, snapshot in zip(contracts, snapshots, strict=True):
-                result[ticker] = _percent_change(_current_price(snapshot), snapshot.close)
+                result[ticker] = _percent_change(current_price(snapshot), snapshot.close)
         return result
 
     def close(self):
@@ -149,24 +149,24 @@ class IBKRProvider(MarketDataProvider):
         return {ticker: self._contracts[ticker] for ticker in tickers if ticker in self._contracts}
 
 
-def _valid_price(value):
+def valid_price(value):
     return value is not None and not math.isnan(value) and value > 0
 
 
-def _current_price(snapshot):
+def current_price(snapshot):
     """Last trade price, or the bid/ask midpoint before the first trade; None when neither is available.
 
     Deliberately never falls back to the previous close, which would read as a 0% move.
     """
-    if _valid_price(snapshot.last):
+    if valid_price(snapshot.last):
         return snapshot.last
-    if _valid_price(snapshot.bid) and _valid_price(snapshot.ask):
+    if valid_price(snapshot.bid) and valid_price(snapshot.ask):
         return (snapshot.bid + snapshot.ask) / 2
     return None
 
 
 def _percent_change(price, previous_close):
-    if price is None or not _valid_price(previous_close):
+    if price is None or not valid_price(previous_close):
         return None
     return (price - previous_close) / previous_close
 

@@ -47,3 +47,14 @@ def config_int(key, default):
         return int(value)
     except ValueError:
         raise ValueError(f"Configuration value {key}={value!r} is not an integer") from None
+
+
+def config_float(key, default):
+    """Returns a numeric configuration value as a float, or ``default`` when it is unset."""
+    value = context.config.get(key)
+    if value is None or not value.strip():
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        raise ValueError(f"Configuration value {key}={value!r} is not a number") from None

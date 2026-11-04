@@ -1,6 +1,6 @@
 import pytest
 
-from market_watcher.config import config_flag, config_int
+from market_watcher.config import config_flag, config_float, config_int
 
 
 class FakeContext:
@@ -71,3 +71,27 @@ def test_non_integer_value_raises(set_config, value):
 
     with pytest.raises(ValueError, match="MINUTES"):
         config_int("MINUTES", default=30)
+
+
+# --- config_float ----------------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(("value", "expected"), [("1000", 1000.0), (" 2.5 ", 2.5), ("1e3", 1000.0), ("-0.5", -0.5)])
+def test_float_values(set_config, value, expected):
+    set_config(CAP=value)
+
+    assert config_float("CAP", default=99.0) == expected
+
+
+@pytest.mark.parametrize("config", [{}, {"CAP": ""}, {"CAP": "  "}])
+def test_unset_or_blank_float_uses_the_default(set_config, config):
+    set_config(**config)
+
+    assert config_float("CAP", default=1000.0) == 1000.0
+
+
+def test_non_numeric_value_raises(set_config):
+    set_config(CAP="a thousand")
+
+    with pytest.raises(ValueError, match="CAP"):
+        config_float("CAP", default=1000.0)

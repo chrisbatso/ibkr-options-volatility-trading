@@ -11,6 +11,7 @@ from market_watcher.config import config_flag, context
 from market_watcher.market_data import create_provider
 from market_watcher.market_hours import AlwaysOpen, USMarketHours, parse_closures
 from market_watcher.notifier import EmailNotifier, SlackNotifier
+from market_watcher.trading import IBKRStraddleTrader, TradingSettings
 from market_watcher.version import VERSION
 
 logger = logging.getLogger(__name__)
@@ -170,13 +171,14 @@ def start(stocks):
     """Starts the MarketWatcher in the foreground; stop it with Ctrl-C (or SIGTERM)."""
     echo("Starting MarketWatcher...")
 
-    data_provider = None
+    closers = []  # providers and traders to disconnect on exit
     started = False
     try:
         echo(f"Reading target stocks from file: {stocks}")
         target_stocks = get_target_stocks(stocks)
 
         data_provider = create_provider()
+        closers.append(data_provider)
         echo(f"Using market data provider: {data_provider.name}")
 
         if config_flag("MARKET_HOURS_ENABLED", default=True):
@@ -199,6 +201,15 @@ def start(stocks):
         if not notifiers:
             echo("Warning: both notifiers are disabled; opportunities will only be logged.")
 
+        trading = TradingSettings.from_config()
+        if trading.enabled:
+            trader = IBKRStraddleTrader(trading)
+            notifiers.append(trader)
+            closers.append(trader)
+            echo(f"Order placement ENABLED: {trading.describe()}")
+        else:
+            echo("Order placement disabled (TRADING_ENABLED=false).")
+
         market_watcher_engine = MarketWatcherEngine(
             target_stocks=target_stocks, notifiers=notifiers, data_provider=data_provider, market_hours=market_hours
         )
@@ -211,10 +222,10 @@ def start(stocks):
         phase = "failed" if started else "failed to start"
         raise click.ClickException(f"MarketWatcher {phase}: {e}") from e
     finally:
-        if data_provider is not None:
+        for closer in closers:
             try:
-                data_provider.close()
+                closer.close()
             except Exception:
-                logger.exception("Could not close the market data provider cleanly")
+                logger.exception("Could not close %s cleanly", type(closer).__name__)
 
     echo("MarketWatcher stopped.")
