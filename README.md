@@ -47,7 +47,7 @@ In the next iteration of development we intend to ship more IBKR TWS API functio
 
 ## How to use MarketWatcher trading bot?
 
-After cloning the repo, rename the `env.template` file to `.env` and populate it with your settings: `email notification interval time`, `daily P&L threashold values`, `email settings`, `slack channel webhook links`, ...
+After cloning the repo, copy `.env.template` to `.env` and populate it with your settings: `email notification interval time`, `daily P&L threashold values`, `email settings`, `slack channel webhook links`, ...
 
 Create `.yaml file with target stocks` (ticker and long/short straddle strategy indicator for that ticker). MarketWatcher engine listens to real-time ticker data feed and notifies you when there is a `potential opportunity for entering into long or short straddle options position`, with that stock as an underlying.
 
@@ -95,52 +95,37 @@ You can run cli tool from:
 
 ### 1. Running in Docker
 
-Building docker image:
+The container reads its configuration from your local `.env` file (passed in through `env_file` in `docker-compose.yaml`), so create that file first.
+
+Build the image and run the CLI:
 
 ```bash
-docker build -t ibkr --rm .
+docker compose build
+docker compose run --rm mw market_watcher_cli start
 ```
 
-Running CLI from docker-compose:
+### 2. Running in a virtual environment
+
+Requires Python 3.10 or newer. Create and activate a virtual environment:
 
 ```bash
-docker-compose run --rm mw market_watcher_cli start
-```
-
-### 2. Running in virtual environment
-
-Install and activatre virtual environment for python 3.x:
-
-```bash
-python3 -m venv /path/to/new/virtual/environment
+python3 -m venv .venv
 source .venv/bin/activate
 ```
 
-Install requirements:
+Install MarketWatcher in editable mode (the `dev` extra adds `pytest` and `ruff`):
 
 ```bash
-pip install -r requirements.txt
+pip install -e ".[dev]"
+
+market_watcher_cli --help
 ```
 
-Install `ibapi` (client for IBKR TWS API):
+Run the linter and the tests:
 
 ```bash
-# Installing ibapi
-cd src/market_watcher/ib_client
-python setup.py bdist_wheel
-pip install src/ib_client/dist/ibapi-9.76.1-py3-none-any.whl
-
-# Running ibapi tests
-python -m unittest discover -s src/ib_client/tests
-```
-
-### Installing MarketWatcher trading bot:
-
-```bash
-cd src
-pip install --editable .
-
-market_watcher_cli start --help
+ruff check . && ruff format --check .
+pytest
 ```
 
 ### Slack requirements

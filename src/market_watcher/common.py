@@ -2,7 +2,6 @@ import time
 from enum import Enum
 
 import yaml
-
 from yahoofinancials import YahooFinancials
 
 from market_watcher.config import context
@@ -92,9 +91,7 @@ class MarketWatcherEngine:
             if not self.daily_pnls[ticker]:
                 continue
 
-            if self.is_investment_opportunity(
-                self.target_stocks[ticker]["strategy"], abs(self.daily_pnls[ticker])
-            ):
+            if self.is_investment_opportunity(self.target_stocks[ticker]["strategy"], abs(self.daily_pnls[ticker])):
                 investment_opportunities.append(ticker)
 
         investment_data = self.get_investment_data(investment_opportunities)
@@ -123,10 +120,7 @@ class MarketWatcherEngine:
         for ticker in investment_opportunities:
             if STRATEGIES.LONG_STRADDLE.value == self.target_stocks[ticker]["strategy"]:
                 long_straddle[ticker] = self.daily_pnls[ticker]
-            elif (
-                STRATEGIES.SHORT_STRADDLE.value
-                == self.target_stocks[ticker]["strategy"]
-            ):
+            elif STRATEGIES.SHORT_STRADDLE.value == self.target_stocks[ticker]["strategy"]:
                 short_straddle[ticker] = self.daily_pnls[ticker]
 
         return {

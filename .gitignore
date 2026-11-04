@@ -2,7 +2,7 @@
 .venv
 
 # Python files
-.pyc
+*.pyc
 __pycache__
 __pycache__/*
 *.egg-info
@@ -24,5 +24,6 @@ log.*
 # PyCharm files
 .idea
 
-# Pytest
+# Pytest / ruff caches
 .pytest_cache
+.ruff_cache

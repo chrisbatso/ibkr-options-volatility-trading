@@ -1,7 +1,6 @@
 import smtplib
 import ssl
 from datetime import datetime
-
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
@@ -10,7 +9,7 @@ from slack_sdk.webhook import WebhookClient
 from market_watcher.common import STRATEGIES
 
 
-class Notifier(object):
+class Notifier:
     def __init__(self):
         pass
 
@@ -18,29 +17,18 @@ class Notifier(object):
         raise NotImplementedError
 
     def _long_straddle_message(self, data):
-        sorted_data = {
-            ticker: pnl
-            for ticker, pnl in sorted(
-                data.items(), key=lambda x: abs(x[1]), reverse=True
-            )
-        }
+        sorted_data = {ticker: pnl for ticker, pnl in sorted(data.items(), key=lambda x: abs(x[1]), reverse=True)}
         formatted_data = self._formatted_data(sorted_data)
         return "\n".join(["Long straddle opportunities:", formatted_data])
 
     def _short_straddle_message(self, data):
-        sorted_data = {
-            ticker: pnl
-            for ticker, pnl in sorted(
-                data.items(), key=lambda x: abs(x[1]), reverse=False
-            )
-        }
+        sorted_data = {ticker: pnl for ticker, pnl in sorted(data.items(), key=lambda x: abs(x[1]), reverse=False)}
         formatted_data = self._formatted_data(sorted_data)
         return "\n".join(["Short straddle opportunities:", formatted_data])
 
     def _formatted_data(self, data):
         formatted_data = [
-            f"{ticker}: {round(abs(pnl*100),3)}% {self._direction(pnl)}"
-            for ticker, pnl in data.items()
+            f"{ticker}: {round(abs(pnl * 100), 3)}% {self._direction(pnl)}" for ticker, pnl in data.items()
         ]
         return "\n".join(formatted_data)
 
@@ -55,7 +43,7 @@ class Notifier(object):
 
 class EmailNotifier(Notifier):
     def __init__(self, config):
-        super(EmailNotifier, self).__init__()
+        super().__init__()
         self.__hostname = config["hostname"]
         self.__port = int(config["port"])
         self.__username = config["username"]
@@ -75,12 +63,8 @@ class EmailNotifier(Notifier):
         now = datetime.now()
         current_datetime = now.strftime("%Y-%m-%d %H:%M:%S")
 
-        long_straddle_message = self._long_straddle_message(
-            investment_data[STRATEGIES.LONG_STRADDLE.value]
-        )
-        short_straddle_message = self._short_straddle_message(
-            investment_data[STRATEGIES.SHORT_STRADDLE.value]
-        )
+        long_straddle_message = self._long_straddle_message(investment_data[STRATEGIES.LONG_STRADDLE.value])
+        short_straddle_message = self._short_straddle_message(investment_data[STRATEGIES.SHORT_STRADDLE.value])
 
         message = MIMEMultipart()
         message["Sender"] = self.__sender
@@ -94,21 +78,17 @@ class EmailNotifier(Notifier):
 
 class SlackNotifier(Notifier):
     def __init__(self, config):
-        super(SlackNotifier, self).__init__()
+        super().__init__()
         self.__long_url = config["long url"]
         self.__short_url = config["short url"]
 
     def notify(self, investment_data):
         if investment_data[STRATEGIES.LONG_STRADDLE.value]:
-            long_straddle_message = self._long_straddle_message(
-                investment_data[STRATEGIES.LONG_STRADDLE.value]
-            )
+            long_straddle_message = self._long_straddle_message(investment_data[STRATEGIES.LONG_STRADDLE.value])
             self.send_message(self.__long_url, long_straddle_message)
 
         if investment_data[STRATEGIES.SHORT_STRADDLE.value]:
-            short_straddle_message = self._short_straddle_message(
-                investment_data[STRATEGIES.SHORT_STRADDLE.value]
-            )
+            short_straddle_message = self._short_straddle_message(investment_data[STRATEGIES.SHORT_STRADDLE.value])
             self.send_message(self.__short_url, short_straddle_message)
 
     def send_message(self, url, text):

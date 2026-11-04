@@ -1,7 +1,7 @@
-import os
 import json
+import os
 from dataclasses import dataclass
-from typing import Any, Dict
+from typing import Any
 
 from dotenv import dotenv_values
 
@@ -11,22 +11,22 @@ class Context:
     """Global context for MarketWatcher trading bot."""
 
     # Config from environment variables
-    config: Dict[str, Any] = None
+    config: dict[str, Any] = None
 
     # MarketWatcher state path
     state_path: str = ""
 
     @property
-    def state(self) -> Dict[str, Any]:
+    def state(self) -> dict[str, Any]:
         """Returns entire state object from json file."""
-        with open(self.state_path, "r") as f:
+        with open(self.state_path) as f:
             state = json.load(f)
             return state
 
     @property
     def running(self) -> bool:
         """Reads and returns running flag from state json."""
-        with open(self.state_path, "r") as f:
+        with open(self.state_path) as f:
             state = json.load(f)
             return state["running"]
 

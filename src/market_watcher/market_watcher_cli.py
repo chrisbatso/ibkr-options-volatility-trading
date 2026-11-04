@@ -1,19 +1,17 @@
 import click
 from click.utils import echo
 
-from market_watcher.version import VERSION
+from market_watcher.common import MarketWatcherEngine, get_email_config, get_slack_config, get_terget_stocks
 from market_watcher.config import context
-from market_watcher.common import get_terget_stocks
-from market_watcher.common import get_email_config, get_slack_config
-from market_watcher.common import MarketWatcherEngine
 from market_watcher.notifier import EmailNotifier, SlackNotifier
+from market_watcher.version import VERSION
 
 
 @click.group()
 def cli():
     """MarketWatcher cli commands."""
     echo(
-        """
+        r"""
          ______              _              _  _  _                 _                 
         |  ___ \            | |         _  | || || |      _        | |                
         | | _ | | ____  ____| |  _ ____| |_| || || | ____| |_  ____| | _   ____  ____ 
@@ -97,9 +95,7 @@ def start(stocks):
             notifiers.append(SlackNotifier(get_slack_config()))
 
         echo("Instantiating MarketWatcher and running the engine.")
-        market_watcher_engine = MarketWatcherEngine(
-            target_stocks=target_stocks, notifiers=notifiers
-        )
+        market_watcher_engine = MarketWatcherEngine(target_stocks=target_stocks, notifiers=notifiers)
         market_watcher_engine.search_for_intestment_opportunities()
     except ValueError as e:
         echo(e)

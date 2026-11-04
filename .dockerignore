@@ -1,0 +1,17 @@
+# Never bake secrets or VCS data into the image; configuration is passed in via env_file.
+.env
+.git
+.github
+
+# Local tooling and build output
+.venv
+__pycache__
+*.pyc
+*.egg-info
+build
+dist
+.pytest_cache
+.ruff_cache
+
+# Not needed at runtime
+img

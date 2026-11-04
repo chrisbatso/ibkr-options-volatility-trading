@@ -1,6 +1,6 @@
 name: MarketWatcher Python package
 
-on: push
+on: [push, pull_request]
 
 jobs:
   build:
@@ -8,28 +8,23 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: [3.8, 3.9]
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
 
     steps:
-      - uses: actions/checkout@v2
+      - uses: actions/checkout@v4
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v2
+        uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Install dependencies
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: Install package with dev dependencies
         run: |
           python -m pip install --upgrade pip
-          python -m pip install flake8 pytest wheel
-          # install requirements
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-          # install IBKR python api client
-          cd src/market_watcher/ib_client && python setup.py bdist_wheel && cd ../../..
-          python -m pip install src/market_watcher/ib_client/dist/ibapi-9.76.1-py3-none-any.whl
-          # Installing market_watcher_cli tool 
-          python -m pip install --editable src/.
-      - name: Lint with flake8
+          python -m pip install -e ".[dev]"
+      - name: Lint and check formatting with ruff
         run: |
-          flake8 src tests
+          ruff check .
+          ruff format --check .
       - name: Test with pytest
-        run: |
-          pytest
+        run: pytest
