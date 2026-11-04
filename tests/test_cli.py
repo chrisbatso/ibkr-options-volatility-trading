@@ -14,7 +14,7 @@ def test_help_lists_the_commands():
     assert result.exit_code == 0
     commands_section = result.output.split("Commands:")[1]
     command_names = {line.split()[0] for line in commands_section.splitlines() if line.strip()}
-    assert command_names == {"start", "config", "test-slack"}
+    assert command_names == {"start", "config", "test-slack", "screen"}
 
 
 def test_config_masks_secrets(monkeypatch):
@@ -180,6 +180,44 @@ class ClosableProvider:
 
     def close(self):
         self.closed += 1
+
+
+def test_screen_writes_the_target_stocks_and_summarises(monkeypatch, tmp_path):
+    from market_watcher import screen as screen_module
+    from market_watcher.screen import History
+
+    def closes(amplitude):
+        return [100.0 * (1 + amplitude * (1 if day % 2 else -1)) for day in range(30)]
+
+    monkeypatch.setattr(screen_module, "load_universe", lambda source: ["CALM", "WILD"])
+    monkeypatch.setattr(
+        screen_module,
+        "fetch_history",
+        lambda tickers: {
+            "CALM": History(closes(0.005), [1e7] * 30),
+            "WILD": History(closes(0.05), [1e7] * 30),
+        },
+    )
+    output = tmp_path / "stocks.yaml"
+
+    result = CliRunner().invoke(market_watcher_cli.cli, ["screen", "--top", "1", "--output", str(output)])
+
+    assert result.exit_code == 0, result.output
+    assert "Long straddle (most volatile): WILD" in result.output
+    assert "Short straddle (least volatile): CALM" in result.output
+    assert f"Wrote {output}" in result.output
+    assert output.exists()
+
+
+def test_screen_fails_clearly(monkeypatch, tmp_path):
+    from market_watcher import screen as screen_module
+
+    monkeypatch.setattr(screen_module, "load_universe", lambda source: (_ for _ in ()).throw(OSError("network down")))
+
+    result = CliRunner().invoke(market_watcher_cli.cli, ["screen", "--output", str(tmp_path / "x.yaml")])
+
+    assert result.exit_code == 1
+    assert "Screen failed: network down" in result.output
 
 
 def test_start_closes_the_market_data_provider_on_exit(start_environment, monkeypatch):

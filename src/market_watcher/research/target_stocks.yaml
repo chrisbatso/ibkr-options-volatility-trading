@@ -1,3 +1,7 @@
+# Output of the original 2021 course research (Russell 3000, weighted historical volatility).
+# Several of these tickers have since been delisted. Regenerate with: market_watcher_cli screen
+# (see README, "Regenerating the target stocks").
+
 ABEO:
   strategy: long straddle
 ACRX:

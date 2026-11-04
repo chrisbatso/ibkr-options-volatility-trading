@@ -26,10 +26,15 @@ dependencies = [
 ibkr = [
     "ib_async>=1.0",
 ]
+# `market_watcher_cli screen`: regenerating the target stocks from a volatility screen.
+research = [
+    "yfinance>=0.2.50",
+]
 dev = [
     "pytest>=8",
     "ruff>=0.8",
     "ib_async>=1.0",
+    "yfinance>=0.2.50",
 ]
 
 [project.scripts]

@@ -28,6 +28,8 @@ In order to profit on a high or low volatility in the equities we traded `option
 Firstly, we started with doing basic market research and finding `historically the most and least volatile stocks` in the past `1 week`, `2 week` and a `1 month` period in the `Russel 3000 index` (in order to capture both the large-cap and the small-cap companies). From those stocks we chose the top 50 stocks with highest and the top 50 lowest historical weighted volatility:
 `Weighted volatility = 0.5 * Vol_1_week + 0.3 * Vol_2_week + 0.2 * Vol_1_month`.
 
+That screen is reproducible with `market_watcher_cli screen` (see *Regenerating the target stocks* below). The committed `target_stocks.yaml` is the 2021 output of this research and is stale - several of its tickers have since been delisted - so regenerate it before use.
+
 Using naive expecation for the future volatility based on the historical volatility, combined with the momentum detected from the daily P&L for the target companies, we enter into `long straddle` or `short straddle` positions.
 
 Our MarketWatcher bot was alerting us for all potential investment opportunities. From the provided list of `target stocks`, trading bot was sending us `alerts via Email and Slack`, when target stocks have `reached configured daily P&L threshold`:
@@ -64,6 +66,7 @@ market_watcher_cli --help
 market_watcher_cli start
 market_watcher_cli config
 market_watcher_cli test-slack
+market_watcher_cli screen
 ```
 
 Example CLI output upon starting MarketWatcher engine:
@@ -134,6 +137,19 @@ Run the linter and the tests:
 ruff check . && ruff format --check .
 pytest
 ```
+
+### Regenerating the target stocks
+
+`market_watcher_cli screen` reproduces the research step. It downloads the iShares Russell 3000 ETF (IWV) holdings as the universe, fetches three months of daily split-adjusted prices from Yahoo Finance, computes the volatility (standard deviation of daily log returns) over the last 5, 10 and 21 trading days, combines them as `0.5 * vol_5d + 0.3 * vol_10d + 0.2 * vol_21d`, and writes the 50 most volatile stocks as long straddle candidates and the 50 least volatile as short straddle candidates to `src/market_watcher/research/target_stocks.yaml`. Stocks below $5 or with less than $5M average daily dollar volume are skipped (penny stocks have noisy volatility and rarely have tradable options); tune that with `--min-price` / `--min-dollar-volume`, and the list size with `--top`.
+
+It needs the `research` extra:
+
+```bash
+pip install -e ".[research]"
+market_watcher_cli screen --report screen_report.csv
+```
+
+`--report` writes every screened stock with its volatilities for inspection. If the iShares download fails, save the holdings CSV from the [IWV product page](https://www.ishares.com/us/products/239714/ishares-russell-3000-etf) (or any file with one ticker per line) and pass it with `--universe path/to/file.csv`.
 
 ### Market data providers
 

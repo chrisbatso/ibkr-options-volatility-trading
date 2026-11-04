@@ -5,6 +5,7 @@ import sys
 import click
 from click.utils import echo
 
+from market_watcher import screen as screen_module
 from market_watcher.common import MarketWatcherEngine, get_email_config, get_slack_config, get_target_stocks
 from market_watcher.config import config_flag, context
 from market_watcher.market_data import create_provider
@@ -88,6 +89,55 @@ def config(notifier):
         config = get_email_config()
         for key, value in config.items():
             echo(f"{key}: {_display_value(key, value)}")
+
+
+@cli.command("screen")
+@click.option(
+    "--universe",
+    default="iwv",
+    show_default=True,
+    help="'iwv' downloads the iShares Russell 3000 ETF holdings; otherwise a CSV/TXT file with tickers.",
+)
+@click.option("--top", default=50, show_default=True, help="Number of stocks per strategy.")
+@click.option("--min-price", default=5.0, show_default=True, help="Skip stocks whose last close is below this (USD).")
+@click.option(
+    "--min-dollar-volume",
+    default=5_000_000.0,
+    show_default=True,
+    help="Skip stocks whose 21-day average dollar volume is below this (USD).",
+)
+@click.option("--output", default=screen_module.DEFAULT_OUTPUT, show_default=True, help="Target stocks YAML to write.")
+@click.option("--report", default=None, help="Also write a CSV with the volatility of every screened stock.")
+def screen_command(universe, top, min_price, min_dollar_volume, output, report):
+    """Regenerates the target stocks file from a historical-volatility screen (needs the `research` extra)."""
+    echo(f"Screening universe {universe!r} for the {top} most and {top} least volatile stocks...")
+
+    try:
+        result = screen_module.run(
+            universe=universe,
+            top=top,
+            min_price=min_price,
+            min_dollar_volume=min_dollar_volume,
+            output=output,
+            report=report,
+        )
+    except Exception as e:
+        raise click.ClickException(f"Screen failed: {e}") from e
+
+    echo(
+        f"Universe: {result.universe_size} tickers, price history for {result.fetched}, eligible: {len(result.ranked)}"
+    )
+    for reason, count in sorted(result.skipped.items()):
+        echo(f"  skipped {count}: {reason}")
+    echo(
+        "Long straddle (most volatile): "
+        + ", ".join(f"{r.ticker} {r.weighted_volatility:.1%}" for r in result.long_straddle)
+    )
+    echo(
+        "Short straddle (least volatile): "
+        + ", ".join(f"{r.ticker} {r.weighted_volatility:.1%}" for r in result.short_straddle)
+    )
+    echo(f"Wrote {output}" + (f" and {report}" if report else ""))
 
 
 def stop_on_signals(engine):
