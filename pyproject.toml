@@ -33,8 +33,6 @@ version = { attr = "market_watcher.version.VERSION" }
 
 [tool.setuptools.packages.find]
 where = ["src"]
-# The vendored IBKR client is not used by the application and is not part of this distribution.
-exclude = ["market_watcher.ib_client*"]
 
 [tool.setuptools.package-data]
 market_watcher = ["research/*.yaml", "state.json"]
@@ -45,7 +43,6 @@ testpaths = ["tests"]
 [tool.ruff]
 line-length = 120
 target-version = "py310"
-extend-exclude = ["src/market_watcher/ib_client"]
 
 [tool.ruff.lint]
 select = [

@@ -150,3 +150,5 @@ Requirements for enabling [Trader Workstation API](https://interactivebrokers.gi
   5. Create API message log file
   6. Logging Level: Error
 - Download [TWS API source code](https://interactivebrokers.github.io/#)
+
+MarketWatcher does not yet talk to TWS directly (see *Future improvements* above). When that integration lands it will depend on the [`ibapi`](https://pypi.org/project/ibapi/) package from PyPI rather than a vendored copy of the client.
