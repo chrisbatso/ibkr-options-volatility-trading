@@ -30,10 +30,10 @@ Firstly, we started with doing basic market research and finding `historically t
 
 Using naive expecation for the future volatility based on the historical volatility, combined with the momentum detected from the daily P&L for the target companies, we enter into `long straddle` or `short straddle` positions.
 
-Our MarketWatcher bot was alerting us for all potential investment opportunities. From the provided list of `target stocks`, trading bot was sending us `alerts via Email and Slack`, when target stocks have `reached configured daily P&L threashold`:
+Our MarketWatcher bot was alerting us for all potential investment opportunities. From the provided list of `target stocks`, trading bot was sending us `alerts via Email and Slack`, when target stocks have `reached configured daily P&L threshold`:
 
-- Long straddle - stocks with absolute daily P&L that are `greater` than `5% P&L threashold`
-- Short straddle - stocks with absolute daily P&L that are `lower` than `0.5% P&L threashold`
+- Long straddle - stocks whose absolute daily P&L is `greater` than `LONG_THRESHOLD` (a fraction, e.g. `0.02` = 2%)
+- Short straddle - stocks whose absolute daily P&L is `lower` than `SHORT_THRESHOLD` (e.g. `0.005` = 0.5%)
 
 Upon getting alerted by the MarketWatcher bot, we `hand picked` into which long and short straddle positions to enter.
 
@@ -47,11 +47,13 @@ In the next iteration of development we intend to ship more IBKR TWS API functio
 
 ## How to use MarketWatcher trading bot?
 
-After cloning the repo, copy `.env.template` to `.env` and populate it with your settings: `email notification interval time`, `daily P&L threashold values`, `email settings`, `slack channel webhook links`, ...
+After cloning the repo, copy `.env.template` to `.env` and populate it with your settings: `email notification interval time`, `daily P&L threshold values`, `email settings`, `slack channel webhook links`, ...
 
 Create `.yaml file with target stocks` (ticker and long/short straddle strategy indicator for that ticker). MarketWatcher engine listens to real-time ticker data feed and notifies you when there is a `potential opportunity for entering into long or short straddle options position`, with that stock as an underlying.
 
 You can control MarketWatcher trading bot using simple `CLI`. After bot is started it will send us an email/slack messages for each investment opportunity it finds.
+
+Each ticker is reported once, when its daily P&L crosses the configured threshold; it is reported again only after it has moved back inside the threshold and crossed it again. If a polling cycle fails (for example Yahoo Finance is unreachable) the error is logged and the bot retries on the next cycle. Stopping the bot with `Ctrl-C`, `market_watcher_cli stop` or a crash always resets its state, so it can be started again right away.
 
 CLI commands:
 
@@ -60,6 +62,7 @@ market_watcher_cli --help
 market_watcher_cli start
 market_watcher_cli stop
 market_watcher_cli config
+market_watcher_cli test-slack
 ```
 
 Example CLI output upon starting MarketWatcher engine:

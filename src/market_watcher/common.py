@@ -1,3 +1,4 @@
+import logging
 import time
 from enum import Enum
 
@@ -6,121 +7,193 @@ from yahoofinancials import YahooFinancials
 
 from market_watcher.config import context
 
+logger = logging.getLogger(__name__)
+
 
 class STRATEGIES(Enum):
     LONG_STRADDLE = "long straddle"
     SHORT_STRADDLE = "short straddle"
 
 
-def get_terget_stocks(file_path):
-    """Reads target stocks for long/short straddle strategies."""
+VALID_STRATEGIES = {strategy.value for strategy in STRATEGIES}
+
+
+def get_target_stocks(file_path):
+    """Reads target stocks for the long/short straddle strategies from a YAML file.
+
+    The file maps tickers to a mapping with a ``strategy`` key::
+
+        AAPL:
+          strategy: short straddle
+
+    Raises ``OSError`` if the file cannot be read, ``yaml.YAMLError`` if it is not
+    valid YAML and ``ValueError`` if its structure is not the one described above.
+    """
+    with open(file_path) as f:
+        target_stocks = yaml.safe_load(f)
+
+    if not isinstance(target_stocks, dict) or not target_stocks:
+        raise ValueError(f"{file_path}: expected a non-empty mapping of ticker -> {{strategy: ...}}")
+
+    for ticker, settings in target_stocks.items():
+        strategy = settings.get("strategy") if isinstance(settings, dict) else None
+        if strategy not in VALID_STRATEGIES:
+            raise ValueError(
+                f"{file_path}: ticker {ticker!r} has invalid strategy {strategy!r}; "
+                f"expected one of {sorted(VALID_STRATEGIES)}"
+            )
+
+    return target_stocks
+
+
+def _required_config(key):
+    """Returns a configuration value from .env / the environment, with a clear error when it is missing."""
     try:
-        with open(file_path) as f:
-            target_stocks = yaml.load(f, Loader=yaml.FullLoader)
-            return target_stocks
-    except Exception as e:
-        print(e)
+        return context.config[key]
+    except KeyError:
+        raise ValueError(f"Missing configuration value {key}; set it in .env or as an environment variable") from None
 
 
 def get_email_config():
     """Returns email notifier related configuration."""
-    email_config = {}
-    email_config["hostname"] = context.config["SMTP_HOSTNAME"]
-    email_config["port"] = context.config["SMTP_PORT"]
-    email_config["username"] = context.config["SMTP_USERNAME"]
-    email_config["password"] = context.config["SMTP_PASSWORD"]
-    email_config["sender"] = context.config["EMAIL_SENDER"]
-    email_config["recipients"] = context.config["EMAIL_RECIPIENTS"]
-    return email_config
+    return {
+        "hostname": _required_config("SMTP_HOSTNAME"),
+        "port": _required_config("SMTP_PORT"),
+        "username": _required_config("SMTP_USERNAME"),
+        "password": _required_config("SMTP_PASSWORD"),
+        "sender": _required_config("EMAIL_SENDER"),
+        "recipients": _required_config("EMAIL_RECIPIENTS"),
+    }
 
 
-def get_pnl_threashold_config():
+def get_pnl_threshold_config():
     """Returns strategy alert configuration."""
-    pnl_threashold = {}
-    pnl_threashold["LONG_THRESHOLD"] = float(context.config["LONG_THRESHOLD"])
-    pnl_threashold["SHORT_THRESHOLD"] = float(context.config["SHORT_THRESHOLD"])
-    return pnl_threashold
+    return {
+        "LONG_THRESHOLD": float(_required_config("LONG_THRESHOLD")),
+        "SHORT_THRESHOLD": float(_required_config("SHORT_THRESHOLD")),
+    }
 
 
 def get_slack_config():
-    slack_config = {}
-    slack_config["long url"] = context.config["SLACK_LONG_WEBHOOK"]
-    slack_config["short url"] = context.config["SLACK_SHORT_WEBHOOK"]
-    return slack_config
+    """Returns Slack notifier related configuration."""
+    return {
+        "long url": _required_config("SLACK_LONG_WEBHOOK"),
+        "short url": _required_config("SLACK_SHORT_WEBHOOK"),
+    }
 
 
 class MarketWatcherEngine:
-    """MarketWatcher core engine logic for scarping financial data."""
+    """MarketWatcher core engine: polls the daily P&L of the target stocks and
+    notifies about long/short straddle opportunities."""
 
-    def __init__(self, target_stocks=None, notifiers=None):
-        self.target_stocks = target_stocks
-        self.notifiers = notifiers
+    def __init__(self, target_stocks=None, notifiers=None, long_threshold=None, short_threshold=None):
+        self.target_stocks = target_stocks or {}
+        self.notifiers = notifiers or []
 
-        pnl_threashold_config = get_pnl_threashold_config()
-        self.long_threshlold = pnl_threashold_config["LONG_THRESHOLD"]
-        self.short_threshlold = pnl_threashold_config["SHORT_THRESHOLD"]
+        if long_threshold is None or short_threshold is None:
+            pnl_threshold_config = get_pnl_threshold_config()
+            if long_threshold is None:
+                long_threshold = pnl_threshold_config["LONG_THRESHOLD"]
+            if short_threshold is None:
+                short_threshold = pnl_threshold_config["SHORT_THRESHOLD"]
+        self.long_threshold = long_threshold
+        self.short_threshold = short_threshold
 
-        self.daily_pnls = None
+        self.daily_pnls = {}
+        # Tickers reported in the previous cycle, per strategy: alerts are sent on threshold crossings only.
+        self._reported = {strategy.value: set() for strategy in STRATEGIES}
+        # Tickers the data source returned no value for, so the warning is logged once rather than every cycle.
+        self._unavailable = set()
 
-    def search_for_intestment_opportunities(self):
-        # Update interval for sending email notifications
-        update_timeout = int(context.config["UPDATE_TIMEOUT"])
+    def search_for_investment_opportunities(self):
+        """Polls the market every ``UPDATE_TIMEOUT`` seconds until the bot is stopped.
 
-        # Remaining time until email alert
+        A failing cycle (for example the data source being unreachable) is logged
+        and retried on the next cycle instead of terminating the bot.
+        """
+        update_timeout = int(_required_config("UPDATE_TIMEOUT"))
         remaining_seconds = update_timeout
 
         while context.running:
             if remaining_seconds > 0:
                 remaining_seconds -= 1
                 time.sleep(1)
-            else:
-                remaining_seconds = update_timeout
-                self.process_latest_market_movements()
-
-    def process_latest_market_movements(self):
-        """Goes through each target stock and checks if there is a
-        potential invetment opportunity.
-
-        If the opportunity is found trader is notified about it though email
-        noticication stating which options trading strategy trader should
-        implement.
-        """
-        self.daily_pnls = self.get_daily_pnls()
-        investment_opportunities = []
-        for ticker in self.target_stocks:
-            if not self.daily_pnls[ticker]:
                 continue
 
-            if self.is_investment_opportunity(self.target_stocks[ticker]["strategy"], abs(self.daily_pnls[ticker])):
+            remaining_seconds = update_timeout
+            try:
+                self.process_latest_market_movements()
+            except Exception:
+                logger.exception("Polling cycle failed; retrying in %d seconds", update_timeout)
+
+    def process_latest_market_movements(self):
+        """Checks every target stock against the threshold of its strategy.
+
+        Returns all current opportunities per strategy and notifies the subscribed
+        notifiers about the ones that are new since the previous cycle, so a stock
+        that stays beyond its threshold is reported once, when it crosses it,
+        rather than on every cycle.
+        """
+        self.daily_pnls = self.get_daily_pnls()
+
+        investment_opportunities = []
+        for ticker, settings in self.target_stocks.items():
+            daily_pnl = self.daily_pnls.get(ticker)
+            if daily_pnl is None:
+                if ticker not in self._unavailable:
+                    logger.warning("No daily P&L available for %s; skipping it until data is available", ticker)
+                    self._unavailable.add(ticker)
+                continue
+            self._unavailable.discard(ticker)
+
+            if self.is_investment_opportunity(settings["strategy"], abs(daily_pnl)):
                 investment_opportunities.append(ticker)
 
         investment_data = self.get_investment_data(investment_opportunities)
+        new_investment_data = self._new_opportunities(investment_data)
 
-        self.notify(investment_data)
+        if any(new_investment_data.values()):
+            self.notify(new_investment_data)
 
         return investment_data
 
+    def _new_opportunities(self, investment_data):
+        """Returns the subset of ``investment_data`` that was not reported in the previous cycle."""
+        new_investment_data = {}
+        for strategy, opportunities in investment_data.items():
+            previously_reported = self._reported.get(strategy, set())
+            new_investment_data[strategy] = {
+                ticker: pnl for ticker, pnl in opportunities.items() if ticker not in previously_reported
+            }
+            self._reported[strategy] = set(opportunities)
+        return new_investment_data
+
     def notify(self, investment_data):
-        """Sends investment updates to subscribed notifiers."""
-        if self.notifiers:
-            for notifier in self.notifiers:
+        """Sends investment updates to the subscribed notifiers.
+
+        A failing notifier is logged and does not prevent the others from being notified.
+        """
+        for notifier in self.notifiers:
+            try:
                 notifier.notify(investment_data)
+            except Exception:
+                logger.exception("Notifier %s failed", type(notifier).__name__)
 
     def get_daily_pnls(self):
-        """Returns daily pnls"""
+        """Returns the daily percent change of each target stock, as a fraction (0.02 == 2%)."""
         target_stocks = list(self.target_stocks.keys())
-        yahoo_financials_target_stocks = YahooFinancials(target_stocks)
-        return yahoo_financials_target_stocks.get_current_percent_change()
+        return YahooFinancials(target_stocks).get_current_percent_change()
 
     def get_investment_data(self, investment_opportunities):
-        """Returns two dictionaries that contain investment data for both strategies"""
+        """Returns the opportunities with their daily P&L, grouped by strategy."""
         long_straddle = {}
         short_straddle = {}
 
         for ticker in investment_opportunities:
-            if STRATEGIES.LONG_STRADDLE.value == self.target_stocks[ticker]["strategy"]:
+            strategy = self.target_stocks[ticker]["strategy"]
+            if STRATEGIES.LONG_STRADDLE.value == strategy:
                 long_straddle[ticker] = self.daily_pnls[ticker]
-            elif STRATEGIES.SHORT_STRADDLE.value == self.target_stocks[ticker]["strategy"]:
+            elif STRATEGIES.SHORT_STRADDLE.value == strategy:
                 short_straddle[ticker] = self.daily_pnls[ticker]
 
         return {
@@ -129,12 +202,9 @@ class MarketWatcherEngine:
         }
 
     def is_investment_opportunity(self, strategy, abs_daily_pnl):
-        """Check if the stock is applicable for one of the options trading strategies."""
+        """Checks whether a stock with this absolute daily P&L is an opportunity for the given strategy."""
         if STRATEGIES.LONG_STRADDLE.value == strategy:
-            if abs_daily_pnl > self.long_threshlold:
-                return True
-        elif STRATEGIES.SHORT_STRADDLE.value == strategy:
-            if abs_daily_pnl < self.short_threshlold:
-                return True
-
+            return abs_daily_pnl > self.long_threshold
+        if STRATEGIES.SHORT_STRADDLE.value == strategy:
+            return abs_daily_pnl < self.short_threshold
         return False
