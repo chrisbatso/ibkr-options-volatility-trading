@@ -47,7 +47,7 @@ In the next iteration of development we intend to ship more IBKR TWS API functio
 
 ## How to use MarketWatcher trading bot?
 
-After cloning the repo, copy `.env.template` to `.env` and populate it with your settings: `polling interval`, `daily P&L threshold values`, `which notifiers to enable`, `email settings`, `slack channel webhook links`, ...
+After cloning the repo, copy `.env.template` to `.env` and populate it with your settings: `polling interval`, `market data provider`, `daily P&L threshold values`, `which notifiers to enable`, `email settings`, `slack channel webhook links`, ...
 
 Create `.yaml file with target stocks` (ticker and long/short straddle strategy indicator for that ticker). MarketWatcher engine listens to real-time ticker data feed and notifies you when there is a `potential opportunity for entering into long or short straddle options position`, with that stock as an underlying.
 
@@ -131,6 +131,16 @@ ruff check . && ruff format --check .
 pytest
 ```
 
+### Market data providers
+
+The engine reads daily P&L through a small `MarketDataProvider` interface (`src/market_watcher/market_data.py`): `get_daily_pnls(tickers)` returns each ticker's daily percent change as a fraction (`0.02` = 2%), or `None` when no figure is available. The provider is selected with `MARKET_DATA_PROVIDER` in `.env`:
+
+| Name | Source |
+|---|---|
+| `yahoo` (default) | Yahoo Finance, through the [`yahoofinancials`](https://github.com/JECSand/yahoofinancials) package |
+
+To add a source (for example IBKR TWS), subclass `MarketDataProvider`, give it a `name`, implement `get_daily_pnls`, and register the class in `PROVIDERS`.
+
 ### Slack requirements
 
 In order to receive the investment opportunities from MarketWatcher bot as [Slack](https://slack.com/intl/en-rs/) messages, you must first create a new Slack app in your workspace and enable [Incoming-Webhooks](https://api.slack.com/messaging/webhooks). We expect to have two separate channels - one for receiving opportunities for a long straddle and the other for the short straddle strategies (see image bellow). Links for Slack webhooks need to be put in the `.env` file.
@@ -154,4 +164,4 @@ Requirements for enabling [Trader Workstation API](https://interactivebrokers.gi
   6. Logging Level: Error
 - Download [TWS API source code](https://interactivebrokers.github.io/#)
 
-MarketWatcher does not yet talk to TWS directly (see *Future improvements* above). When that integration lands it will depend on the [`ibapi`](https://pypi.org/project/ibapi/) package from PyPI rather than a vendored copy of the client.
+MarketWatcher does not yet talk to TWS directly (see *Future improvements* above). When that integration lands it will be a `MarketDataProvider` implementation (see *Market data providers* above) that depends on the [`ibapi`](https://pypi.org/project/ibapi/) package from PyPI rather than a vendored copy of the client.

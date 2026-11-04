@@ -12,6 +12,7 @@ from market_watcher.common import (
     get_slack_config,
     get_target_stocks,
 )
+from market_watcher.market_data import create_provider
 from market_watcher.notifier import EmailNotifier, SlackNotifier
 from market_watcher.version import VERSION
 
@@ -125,6 +126,9 @@ def start(stocks):
         echo(f"Reading target stocks from file: {stocks}")
         target_stocks = get_target_stocks(stocks)
 
+        data_provider = create_provider()
+        echo(f"Using market data provider: {data_provider.name}")
+
         notifiers = []
 
         if config_flag("EMAIL_NOTIFIER_ENABLED", default=True):
@@ -138,7 +142,9 @@ def start(stocks):
         if not notifiers:
             echo("Warning: both notifiers are disabled; opportunities will only be logged.")
 
-        market_watcher_engine = MarketWatcherEngine(target_stocks=target_stocks, notifiers=notifiers)
+        market_watcher_engine = MarketWatcherEngine(
+            target_stocks=target_stocks, notifiers=notifiers, data_provider=data_provider
+        )
     except Exception as e:
         raise click.ClickException(f"MarketWatcher failed to start: {e}") from e
 

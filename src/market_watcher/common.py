@@ -3,9 +3,9 @@ import threading
 from enum import Enum
 
 import yaml
-from yahoofinancials import YahooFinancials
 
 from market_watcher.config import context
+from market_watcher.market_data import YahooFinanceProvider
 
 logger = logging.getLogger(__name__)
 
@@ -100,12 +100,16 @@ def get_slack_config():
 
 
 class MarketWatcherEngine:
-    """MarketWatcher core engine: polls the daily P&L of the target stocks and
-    notifies about long/short straddle opportunities."""
+    """MarketWatcher core engine: polls the daily P&L of the target stocks through a
+    :class:`~market_watcher.market_data.MarketDataProvider` and notifies about
+    long/short straddle opportunities."""
 
-    def __init__(self, target_stocks=None, notifiers=None, long_threshold=None, short_threshold=None):
+    def __init__(
+        self, target_stocks=None, notifiers=None, long_threshold=None, short_threshold=None, data_provider=None
+    ):
         self.target_stocks = target_stocks or {}
         self.notifiers = notifiers or []
+        self.data_provider = data_provider if data_provider is not None else YahooFinanceProvider()
 
         if long_threshold is None or short_threshold is None:
             pnl_threshold_config = get_pnl_threshold_config()
@@ -163,7 +167,7 @@ class MarketWatcherEngine:
         that stays beyond its threshold is reported once, when it crosses it,
         rather than on every cycle.
         """
-        self.daily_pnls = self.get_daily_pnls()
+        self.daily_pnls = self.data_provider.get_daily_pnls(list(self.target_stocks))
 
         investment_opportunities = []
         for ticker, settings in self.target_stocks.items():
@@ -208,11 +212,6 @@ class MarketWatcherEngine:
                 notifier.notify(investment_data)
             except Exception:
                 logger.exception("Notifier %s failed", type(notifier).__name__)
-
-    def get_daily_pnls(self):
-        """Returns the daily percent change of each target stock, as a fraction (0.02 == 2%)."""
-        target_stocks = list(self.target_stocks.keys())
-        return YahooFinancials(target_stocks).get_current_percent_change()
 
     def get_investment_data(self, investment_opportunities):
         """Returns the opportunities with their daily P&L, grouped by strategy."""

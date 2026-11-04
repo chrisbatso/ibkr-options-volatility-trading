@@ -92,6 +92,7 @@ def test_first_signal_stops_gracefully_and_a_second_one_exits(installed_handlers
 def start_environment(monkeypatch, tmp_path):
     """Config and stubs that let `start` run without notifiers, signals or a real polling loop."""
     for key, value in {
+        "MARKET_DATA_PROVIDER": "yahoo",
         "EMAIL_NOTIFIER_ENABLED": "false",
         "SLACK_NOTIFIER_ENABLED": "false",
         "LONG_THRESHOLD": "0.02",
@@ -122,6 +123,8 @@ def test_start_runs_the_engine_and_exits_cleanly(start_environment):
     [engine] = engines_run
     assert engine.target_stocks == {"AAPL": {"strategy": "short straddle"}}
     assert engine.notifiers == []
+    assert engine.data_provider.name == "yahoo"
+    assert "Using market data provider: yahoo" in result.output
     assert "both notifiers are disabled" in result.output
     assert "MarketWatcher started." in result.output
     assert "MarketWatcher stopped." in result.output
