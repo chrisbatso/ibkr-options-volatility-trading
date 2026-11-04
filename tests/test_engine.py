@@ -1,3 +1,5 @@
+import threading
+
 import pytest
 
 from market_watcher.common import STRATEGIES, MarketWatcherEngine
@@ -119,27 +121,76 @@ def test_a_failing_notifier_does_not_block_the_others(monkeypatch):
 
 
 class FakeContext:
-    """Stands in for ``market_watcher.config.context``: runs for a fixed number of cycles without sleeping."""
+    """Stands in for ``market_watcher.config.context`` with the given polling interval."""
 
-    def __init__(self, cycles):
-        self.config = {"UPDATE_TIMEOUT": "0"}
-        self._cycles = cycles
+    def __init__(self, update_timeout="0"):
+        self.config = {"UPDATE_TIMEOUT": update_timeout}
 
-    @property
-    def running(self):
-        self._cycles -= 1
-        return self._cycles >= 0
+
+class StopOnNotify(RecordingNotifier):
+    """Records the notification, then asks the engine to stop so the polling loop ends."""
+
+    def __init__(self, engine):
+        super().__init__()
+        self.engine = engine
+
+    def notify(self, investment_data):
+        super().notify(investment_data)
+        self.engine.stop()
+
+
+class EventNotifier:
+    """Sets a threading event when notified."""
+
+    def __init__(self, event):
+        self.event = event
+
+    def notify(self, investment_data):
+        self.event.set()
 
 
 def test_polling_loop_survives_a_failing_cycle(monkeypatch):
-    monkeypatch.setattr("market_watcher.common.context", FakeContext(cycles=2))
-    notifier = RecordingNotifier()
+    monkeypatch.setattr("market_watcher.common.context", FakeContext())
     engine = make_engine(
         monkeypatch,
         [RuntimeError("Yahoo Finance is unreachable"), {"ABEO": 7.59, "ACRX": 4, "TPCO": 0.3, "TTMI": 0.6}],
-        notifiers=[notifier],
     )
+    notifier = StopOnNotify(engine)
+    engine.notifiers.append(notifier)
 
     engine.search_for_investment_opportunities()
 
     assert notifier.calls == [{LONG: {"ABEO": 7.59}, SHORT: {"TPCO": 0.3}}]
+    assert engine.stopping
+
+
+def test_polling_loop_returns_at_once_when_stopped_before_it_starts(monkeypatch):
+    """A stop request that arrives during start-up must not be lost."""
+    monkeypatch.setattr("market_watcher.common.context", FakeContext())
+    fetches = []
+    monkeypatch.setattr(MarketWatcherEngine, "get_daily_pnls", lambda self: fetches.append(1) or {})
+    engine = MarketWatcherEngine(TARGET_STOCKS, long_threshold=5, short_threshold=0.5)
+
+    engine.stop()
+    engine.search_for_investment_opportunities()
+
+    assert fetches == []
+
+
+def test_stop_interrupts_the_wait_between_cycles(monkeypatch):
+    """stop() from another thread (or a signal handler) must not wait out a long polling interval."""
+    monkeypatch.setattr("market_watcher.common.context", FakeContext(update_timeout="3600"))
+    first_cycle_done = threading.Event()
+    engine = make_engine(
+        monkeypatch,
+        {"ABEO": 7.59, "ACRX": 4, "TPCO": 0.3, "TTMI": 0.6},
+        notifiers=[EventNotifier(first_cycle_done)],
+    )
+    worker = threading.Thread(target=engine.search_for_investment_opportunities, daemon=True)
+
+    worker.start()
+    assert first_cycle_done.wait(timeout=5), "first polling cycle did not run"
+    engine.stop()
+    worker.join(timeout=5)
+
+    assert not worker.is_alive(), "polling loop did not return promptly after stop()"

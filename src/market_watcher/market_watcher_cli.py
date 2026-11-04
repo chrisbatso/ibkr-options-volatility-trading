@@ -1,15 +1,25 @@
 import logging
+import signal
+import sys
 
 import click
 from click.utils import echo
 
-from market_watcher.common import MarketWatcherEngine, get_email_config, get_slack_config, get_target_stocks
-from market_watcher.config import context
+from market_watcher.common import (
+    MarketWatcherEngine,
+    config_flag,
+    get_email_config,
+    get_slack_config,
+    get_target_stocks,
+)
 from market_watcher.notifier import EmailNotifier, SlackNotifier
 from market_watcher.version import VERSION
 
 # Prefix of a Slack incoming-webhook URL; the remainder is the secret part.
 SLACK_WEBHOOK_PREFIX = "https://hooks.slack.com/services/"
+
+# Signals that stop the bot: Ctrl-C in a terminal, `docker stop` / `kill` from outside.
+STOP_SIGNALS = (signal.SIGINT, signal.SIGTERM)
 
 
 @click.group()
@@ -81,6 +91,26 @@ def config(notifier):
             echo(f"{key}: {_display_value(key, value)}")
 
 
+def stop_on_signals(engine):
+    """Installs handlers so SIGINT (Ctrl-C) and SIGTERM (`docker stop`, `kill`) stop ``engine`` gracefully.
+
+    The first signal lets the current polling cycle finish; a second one exits
+    immediately. Returns the handler so it can also be invoked directly.
+    """
+
+    def handle(signum, frame):
+        name = signal.Signals(signum).name
+        if engine.stopping:
+            echo(f"Received {name} again, exiting immediately.")
+            sys.exit(128 + signum)
+        echo(f"Received {name}, stopping MarketWatcher after the current cycle (send it again to exit immediately).")
+        engine.stop()
+
+    for stop_signal in STOP_SIGNALS:
+        signal.signal(stop_signal, handle)
+    return handle
+
+
 @cli.command()
 @click.option(
     "--stocks",
@@ -88,14 +118,8 @@ def config(notifier):
     help="YAML file with the target stocks for the long and short straddle option strategies.",
 )
 def start(stocks):
-    """Starts the MarketWatcher."""
+    """Starts the MarketWatcher in the foreground; stop it with Ctrl-C (or SIGTERM)."""
     echo("Starting MarketWatcher...")
-
-    try:
-        context.running = True
-    except ValueError as e:
-        raise click.ClickException(str(e)) from e
-    echo("MarketWatcher started.")
 
     try:
         echo(f"Reading target stocks from file: {stocks}")
@@ -103,33 +127,27 @@ def start(stocks):
 
         notifiers = []
 
-        if context.state["email"]:
+        if config_flag("EMAIL_NOTIFIER_ENABLED", default=True):
             echo("Instantiating email notifier...")
             notifiers.append(EmailNotifier(get_email_config()))
 
-        if context.state["slack"]:
+        if config_flag("SLACK_NOTIFIER_ENABLED", default=True):
             echo("Instantiating slack notifier...")
             notifiers.append(SlackNotifier(get_slack_config()))
 
-        echo("Instantiating MarketWatcher and running the engine.")
+        if not notifiers:
+            echo("Warning: both notifiers are disabled; opportunities will only be logged.")
+
         market_watcher_engine = MarketWatcherEngine(target_stocks=target_stocks, notifiers=notifiers)
+    except Exception as e:
+        raise click.ClickException(f"MarketWatcher failed to start: {e}") from e
+
+    stop_on_signals(market_watcher_engine)
+    echo("MarketWatcher started. Press Ctrl-C to stop.")
+
+    try:
         market_watcher_engine.search_for_investment_opportunities()
     except Exception as e:
         raise click.ClickException(f"MarketWatcher failed: {e}") from e
-    finally:
-        # Whether we exit through `stop`, Ctrl-C or an error, never leave the state file saying "running".
-        if context.running:
-            context.running = False
-            echo("MarketWatcher stopped.")
 
-
-@cli.command()
-def stop():
-    """Stops the MarketWatcher."""
-    echo("Stopping MarketWatcher...")
-
-    try:
-        context.running = False
-        echo("MarketWatcher stopped.")
-    except ValueError as e:
-        echo(e)
+    echo("MarketWatcher stopped.")

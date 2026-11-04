@@ -1,5 +1,5 @@
 import logging
-import time
+import threading
 from enum import Enum
 
 import yaml
@@ -54,6 +54,23 @@ def _required_config(key):
         raise ValueError(f"Missing configuration value {key}; set it in .env or as an environment variable") from None
 
 
+_TRUE_VALUES = {"1", "true", "yes", "on"}
+_FALSE_VALUES = {"0", "false", "no", "off"}
+
+
+def config_flag(key, default):
+    """Returns a boolean configuration value (true/false, yes/no, on/off, 1/0), or ``default`` when it is unset."""
+    value = context.config.get(key)
+    if value is None or not value.strip():
+        return default
+    normalized = value.strip().lower()
+    if normalized in _TRUE_VALUES:
+        return True
+    if normalized in _FALSE_VALUES:
+        return False
+    raise ValueError(f"Configuration value {key}={value!r} is not a boolean; use true or false")
+
+
 def get_email_config():
     """Returns email notifier related configuration."""
     return {
@@ -104,27 +121,39 @@ class MarketWatcherEngine:
         self._reported = {strategy.value: set() for strategy in STRATEGIES}
         # Tickers the data source returned no value for, so the warning is logged once rather than every cycle.
         self._unavailable = set()
+        # Set by stop(); the polling loop waits on it so a stop request is honoured without waiting out the interval.
+        self._stop_event = threading.Event()
+
+    def stop(self):
+        """Asks a running :meth:`search_for_investment_opportunities` loop to return once the current cycle is done.
+
+        Safe to call from a signal handler or another thread. Calling it before the
+        loop starts makes the loop return immediately, so a stop request that arrives
+        during start-up is not lost.
+        """
+        self._stop_event.set()
+
+    @property
+    def stopping(self):
+        """Whether :meth:`stop` has been called."""
+        return self._stop_event.is_set()
 
     def search_for_investment_opportunities(self):
-        """Polls the market every ``UPDATE_TIMEOUT`` seconds until the bot is stopped.
+        """Polls the market every ``UPDATE_TIMEOUT`` seconds until :meth:`stop` is called.
 
-        A failing cycle (for example the data source being unreachable) is logged
-        and retried on the next cycle instead of terminating the bot.
+        The first cycle runs immediately. A failing cycle (for example the data
+        source being unreachable) is logged and retried on the next cycle instead
+        of terminating the bot.
         """
         update_timeout = int(_required_config("UPDATE_TIMEOUT"))
-        remaining_seconds = update_timeout
 
-        while context.running:
-            if remaining_seconds > 0:
-                remaining_seconds -= 1
-                time.sleep(1)
-                continue
-
-            remaining_seconds = update_timeout
+        while not self._stop_event.is_set():
             try:
                 self.process_latest_market_movements()
             except Exception:
                 logger.exception("Polling cycle failed; retrying in %d seconds", update_timeout)
+            # Returns as soon as stop() is called, so shutdown does not wait out the interval.
+            self._stop_event.wait(update_timeout)
 
     def process_latest_market_movements(self):
         """Checks every target stock against the threshold of its strategy.
@@ -153,6 +182,7 @@ class MarketWatcherEngine:
         new_investment_data = self._new_opportunities(investment_data)
 
         if any(new_investment_data.values()):
+            logger.info("New opportunities: %s", new_investment_data)
             self.notify(new_investment_data)
 
         return investment_data

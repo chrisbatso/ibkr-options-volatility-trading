@@ -47,20 +47,19 @@ In the next iteration of development we intend to ship more IBKR TWS API functio
 
 ## How to use MarketWatcher trading bot?
 
-After cloning the repo, copy `.env.template` to `.env` and populate it with your settings: `email notification interval time`, `daily P&L threshold values`, `email settings`, `slack channel webhook links`, ...
+After cloning the repo, copy `.env.template` to `.env` and populate it with your settings: `polling interval`, `daily P&L threshold values`, `which notifiers to enable`, `email settings`, `slack channel webhook links`, ...
 
 Create `.yaml file with target stocks` (ticker and long/short straddle strategy indicator for that ticker). MarketWatcher engine listens to real-time ticker data feed and notifies you when there is a `potential opportunity for entering into long or short straddle options position`, with that stock as an underlying.
 
 You can control MarketWatcher trading bot using simple `CLI`. After bot is started it will send us an email/slack messages for each investment opportunity it finds.
 
-Each ticker is reported once, when its daily P&L crosses the configured threshold; it is reported again only after it has moved back inside the threshold and crossed it again. If a polling cycle fails (for example Yahoo Finance is unreachable) the error is logged and the bot retries on the next cycle. Stopping the bot with `Ctrl-C`, `market_watcher_cli stop` or a crash always resets its state, so it can be started again right away.
+Each ticker is reported once, when its daily P&L crosses the configured threshold; it is reported again only after it has moved back inside the threshold and crossed it again. If a polling cycle fails (for example Yahoo Finance is unreachable) the error is logged and the bot retries on the next cycle. The bot runs in the foreground: stop it with `Ctrl-C` (or `SIGTERM`, which is what `docker stop` sends). It finishes the current polling cycle and exits cleanly; a second `Ctrl-C` exits immediately.
 
 CLI commands:
 
 ```bash
 market_watcher_cli --help
 market_watcher_cli start
-market_watcher_cli stop
 market_watcher_cli config
 market_watcher_cli test-slack
 ```
@@ -84,11 +83,10 @@ Example CLI output upon starting MarketWatcher engine:
 
 
         Starting MarketWatcher...
-        MarketWatcher started
         Reading target stocks from file: src/market_watcher/research/target_stocks.yaml
         Instantiating email notifier...
         Instantiating slack notifier...
-        Instantiating MarketWatcher and running the engine
+        MarketWatcher started. Press Ctrl-C to stop.
 ```
 
 You can run cli tool from:
@@ -106,6 +104,8 @@ Build the image and run the CLI:
 docker compose build
 docker compose run --rm mw market_watcher_cli start
 ```
+
+Stop it with `Ctrl-C`. If you run it detached, `docker stop` sends `SIGTERM` and the bot shuts down cleanly after its current cycle.
 
 ### 2. Running in a virtual environment
 

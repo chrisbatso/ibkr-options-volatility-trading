@@ -35,7 +35,7 @@ version = { attr = "market_watcher.version.VERSION" }
 where = ["src"]
 
 [tool.setuptools.package-data]
-market_watcher = ["research/*.yaml", "state.json"]
+market_watcher = ["research/*.yaml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
