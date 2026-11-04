@@ -1,17 +1,21 @@
 """Market data sources for the MarketWatcher engine.
 
 A provider answers one question: what is the daily percent change of each
-target stock right now? To add a source (for example IBKR TWS), subclass
-:class:`MarketDataProvider`, give it a ``name``, implement ``get_daily_pnls``
-and register the class in :data:`PROVIDERS`.
+target stock right now? To add a source, subclass :class:`MarketDataProvider`,
+give it a ``name``, implement ``get_daily_pnls`` and register the class in
+:data:`PROVIDERS`.
 """
 
+import logging
+import math
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
 
 from yahoofinancials import YahooFinancials
 
-from market_watcher.config import context
+from market_watcher.config import config_int, context
+
+logger = logging.getLogger(__name__)
 
 
 class MarketDataProvider(ABC):
@@ -29,6 +33,9 @@ class MarketDataProvider(ABC):
         Transient failures may be raised: the engine logs them and retries on its
         next polling cycle.
         """
+
+    def close(self):  # noqa: B027 - an intentional no-op default, not a hook every provider must implement
+        """Releases resources held by the provider (connections, sessions). The default does nothing."""
 
 
 class YahooFinanceProvider(MarketDataProvider):
@@ -54,7 +61,120 @@ def _as_fraction(value):
     return float(value)
 
 
-PROVIDERS: dict[str, type[MarketDataProvider]] = {YahooFinanceProvider.name: YahooFinanceProvider}
+class IBKRProvider(MarketDataProvider):
+    """Daily P&L from Interactive Brokers TWS / IB Gateway through the ``ib_async`` package.
+
+    One market data snapshot per ticker; the daily percent change is
+    ``(current price - previous close) / previous close`` where the current price
+    is the last trade or, before the first trade, the bid/ask midpoint. Connects
+    lazily (read-only) on the first request and reconnects if the link drops.
+    Requires the optional dependency: ``pip install "market_watcher[ibkr]"``.
+    """
+
+    name = "ibkr"
+
+    def __init__(self, host=None, port=None, client_id=None, market_data_type=None, timeout=None, ib_factory=None):
+        self.host = host if host is not None else (context.config.get("IBKR_HOST") or "127.0.0.1")
+        self.port = port if port is not None else config_int("IBKR_PORT", default=7497)
+        self.client_id = client_id if client_id is not None else config_int("IBKR_CLIENT_ID", default=1)
+        self.market_data_type = (
+            market_data_type if market_data_type is not None else config_int("IBKR_MARKET_DATA_TYPE", default=3)
+        )
+        self.timeout = timeout if timeout is not None else config_int("IBKR_TIMEOUT", default=10)
+        self._ib_factory = ib_factory
+        self._ib = None
+        self._contracts = {}  # ticker -> qualified contract, per connection
+        self._unresolved = set()  # tickers IB could not resolve, per connection
+
+    def get_daily_pnls(self, tickers):
+        tickers = list(tickers)
+        if not tickers:
+            return {}
+        ib = self._connect()
+        contracts = self._qualify(ib, tickers)
+        result = dict.fromkeys(tickers)
+        if contracts:
+            snapshots = ib.reqTickers(*contracts.values())
+            for ticker, snapshot in zip(contracts, snapshots, strict=True):
+                result[ticker] = _percent_change(_current_price(snapshot), snapshot.close)
+        return result
+
+    def close(self):
+        if self._ib is not None and self._ib.isConnected():
+            self._ib.disconnect()
+            logger.info("Disconnected from IBKR")
+        self._ib = None
+
+    def _connect(self):
+        if self._ib is not None and self._ib.isConnected():
+            return self._ib
+        if self._ib_factory is None:
+            try:
+                from ib_async import IB
+            except ImportError:
+                raise RuntimeError(
+                    'The ibkr market data provider needs the ib_async package: pip install "market_watcher[ibkr]"'
+                ) from None
+            self._ib_factory = IB
+        ib = self._ib_factory()
+        ib.RequestTimeout = self.timeout
+        ib.connect(self.host, self.port, clientId=self.client_id, timeout=self.timeout, readonly=True)
+        ib.reqMarketDataType(self.market_data_type)
+        logger.info(
+            "Connected to IBKR at %s:%s (client id %s, market data type %s)",
+            self.host,
+            self.port,
+            self.client_id,
+            self.market_data_type,
+        )
+        self._ib = ib
+        self._contracts = {}
+        self._unresolved = set()
+        return ib
+
+    def _qualify(self, ib, tickers):
+        """Resolves tickers to IB stock contracts (SMART / USD), remembering the outcome for this connection."""
+        from ib_async import Stock
+
+        missing = [ticker for ticker in tickers if ticker not in self._contracts and ticker not in self._unresolved]
+        if missing:
+            candidates = [Stock(ticker, "SMART", "USD") for ticker in missing]
+            ib.qualifyContracts(*candidates)
+            for ticker, contract in zip(missing, candidates, strict=True):
+                if contract.conId:
+                    self._contracts[ticker] = contract
+                else:
+                    self._unresolved.add(ticker)
+                    logger.warning("IBKR could not resolve %s as a US stock; it will be skipped", ticker)
+        return {ticker: self._contracts[ticker] for ticker in tickers if ticker in self._contracts}
+
+
+def _valid_price(value):
+    return value is not None and not math.isnan(value) and value > 0
+
+
+def _current_price(snapshot):
+    """Last trade price, or the bid/ask midpoint before the first trade; None when neither is available.
+
+    Deliberately never falls back to the previous close, which would read as a 0% move.
+    """
+    if _valid_price(snapshot.last):
+        return snapshot.last
+    if _valid_price(snapshot.bid) and _valid_price(snapshot.ask):
+        return (snapshot.bid + snapshot.ask) / 2
+    return None
+
+
+def _percent_change(price, previous_close):
+    if price is None or not _valid_price(previous_close):
+        return None
+    return (price - previous_close) / previous_close
+
+
+PROVIDERS: dict[str, type[MarketDataProvider]] = {
+    YahooFinanceProvider.name: YahooFinanceProvider,
+    IBKRProvider.name: IBKRProvider,
+}
 DEFAULT_PROVIDER = YahooFinanceProvider.name
 
 

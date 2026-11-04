@@ -22,9 +22,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Interactive Brokers market data (MARKET_DATA_PROVIDER=ibkr) through TWS / IB Gateway.
+ibkr = [
+    "ib_async>=1.0",
+]
 dev = [
     "pytest>=8",
     "ruff>=0.8",
+    "ib_async>=1.0",
 ]
 
 [project.scripts]

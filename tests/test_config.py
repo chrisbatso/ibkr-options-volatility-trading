@@ -1,6 +1,6 @@
 import pytest
 
-from market_watcher.common import config_flag, config_int
+from market_watcher.config import config_flag, config_int
 
 
 class FakeContext:
@@ -11,7 +11,7 @@ class FakeContext:
 @pytest.fixture
 def set_config(monkeypatch):
     def _set(**config):
-        monkeypatch.setattr("market_watcher.common.context", FakeContext(**config))
+        monkeypatch.setattr("market_watcher.config.context", FakeContext(**config))
 
     return _set
 

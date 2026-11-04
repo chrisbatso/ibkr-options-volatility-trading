@@ -167,3 +167,27 @@ def test_start_fails_clearly_when_the_stocks_file_is_missing(start_environment, 
     assert "MarketWatcher failed to start" in result.output
     assert "missing.yaml" in result.output
     assert engines_run == []
+
+
+class ClosableProvider:
+    name = "closable"
+
+    def __init__(self):
+        self.closed = 0
+
+    def get_daily_pnls(self, tickers):
+        return dict.fromkeys(tickers)
+
+    def close(self):
+        self.closed += 1
+
+
+def test_start_closes_the_market_data_provider_on_exit(start_environment, monkeypatch):
+    stocks, _ = start_environment
+    provider = ClosableProvider()
+    monkeypatch.setattr(market_watcher_cli, "create_provider", lambda: provider)
+
+    result = CliRunner().invoke(market_watcher_cli.cli, ["start", "--stocks", str(stocks)])
+
+    assert result.exit_code == 0, result.output
+    assert provider.closed == 1

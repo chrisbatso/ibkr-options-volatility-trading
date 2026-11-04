@@ -43,7 +43,7 @@ Upon getting alerted by the MarketWatcher bot, we `hand picked` into which long 
 
 ### Future improvements
 
-In the next iteration of development we intend to ship more IBKR TWS API functionality so that daily P&L is fetched from there. We would also like to automate the whole process, by first adding support to our trading bot to place orders on TWS and after that to fully implement algotrading strategy.
+Daily P&L can now be read from IBKR TWS as well as from Yahoo Finance (see *Market data providers* below). The next step is to automate the whole process: first add support for placing orders on TWS, then implement the full algotrading strategy.
 
 ## How to use MarketWatcher trading bot?
 
@@ -109,6 +109,8 @@ docker compose run --rm mw market_watcher_cli start
 
 Stop it with `Ctrl-C`. If you run it detached, `docker stop` sends `SIGTERM` and the bot shuts down cleanly after its current cycle.
 
+To use the `ibkr` provider from the container, set `IBKR_HOST=host.docker.internal` (`docker-compose.yaml` maps that name to the host) and allow that address in the TWS API settings instead of "localhost only".
+
 ### 2. Running in a virtual environment
 
 Requires Python 3.10 or newer. Create and activate a virtual environment:
@@ -140,6 +142,7 @@ The engine reads daily P&L through a small `MarketDataProvider` interface (`src/
 | Name | Source |
 |---|---|
 | `yahoo` (default) | Yahoo Finance, through the [`yahoofinancials`](https://github.com/JECSand/yahoofinancials) package |
+| `ibkr` | Interactive Brokers TWS / IB Gateway, through the [`ib_async`](https://github.com/ib-api-reloaded/ib_async) package (`pip install -e ".[ibkr]"`; see *IBKR requirements* below) |
 
 To add a source (for example IBKR TWS), subclass `MarketDataProvider`, give it a `name`, implement `get_daily_pnls`, and register the class in `PROVIDERS`.
 
@@ -153,17 +156,14 @@ In order to receive the investment opportunities from MarketWatcher bot as [Slac
 
 ### IBKR requirements
 
-Requirements for enabling [Trader Workstation API](https://interactivebrokers.github.io/tws-api/):
+To read the daily P&L from Interactive Brokers instead of Yahoo Finance:
 
-- Download and install [Trader Workstation](https://www.interactivebrokers.com/en/index.php?f=14099#tws-software)
-- Download and install [IB Gateway](https://www.interactivebrokers.com/en/index.php?f=16457)
-- Enable following setting in the TWS (`File -> Global Configuration -> API -> Settings`):
-  1. Enable ActiveX and Socket Clients
-  2. Read-Only API (no order placing, only data reading for our scraping bot)
-  3. Socket port: 7497 (Paper)/7496(Live)
-  4. Allow connections from localhost only
-  5. Create API message log file
-  6. Logging Level: Error
-- Download [TWS API source code](https://interactivebrokers.github.io/#)
+1. Install the optional dependency: `pip install -e ".[ibkr]"` (the Docker image includes it). It uses [`ib_async`](https://github.com/ib-api-reloaded/ib_async), which speaks the TWS protocol itself, so IB's `ibapi` package is not needed.
+2. Run [Trader Workstation](https://www.interactivebrokers.com/en/index.php?f=14099#tws-software) or [IB Gateway](https://www.interactivebrokers.com/en/index.php?f=16457) and enable the API (`File -> Global Configuration -> API -> Settings`):
+   - Enable ActiveX and Socket Clients
+   - Read-Only API (MarketWatcher only reads market data and connects in read-only mode)
+   - Socket port: 7497 (TWS paper) / 7496 (TWS live) / 4002 (IB Gateway paper) / 4001 (IB Gateway live)
+   - Allow connections from localhost only, unless MarketWatcher runs in Docker (see *Running in Docker*)
+3. Set `MARKET_DATA_PROVIDER=ibkr` and the `IBKR_*` settings in `.env`.
 
-MarketWatcher does not yet talk to TWS directly (see *Future improvements* above). When that integration lands it will be a `MarketDataProvider` implementation (see *Market data providers* above) that depends on the [`ibapi`](https://pypi.org/project/ibapi/) package from PyPI rather than a vendored copy of the client.
+The bot takes one market data snapshot per target stock and computes the daily change as `(price - previous close) / previous close`, using the last trade or, before the first trade of the day, the bid/ask midpoint. Without a market data subscription IB serves delayed (15-20 minute) data: `IBKR_MARKET_DATA_TYPE=3` (the default) accepts that, `1` insists on live data. Tickers IB cannot resolve as US stocks are skipped with a warning.

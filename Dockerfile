@@ -8,6 +8,6 @@ WORKDIR /app
 # Configuration (.env) is deliberately excluded via .dockerignore and must be
 # supplied at runtime (see env_file in docker-compose.yaml).
 COPY . .
-RUN pip install --no-cache-dir -e .
+RUN pip install --no-cache-dir -e ".[ibkr]"
 
 CMD ["bash"]

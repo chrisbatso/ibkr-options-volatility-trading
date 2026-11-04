@@ -5,18 +5,14 @@ import sys
 import click
 from click.utils import echo
 
-from market_watcher.common import (
-    MarketWatcherEngine,
-    config_flag,
-    get_email_config,
-    get_slack_config,
-    get_target_stocks,
-)
-from market_watcher.config import context
+from market_watcher.common import MarketWatcherEngine, get_email_config, get_slack_config, get_target_stocks
+from market_watcher.config import config_flag, context
 from market_watcher.market_data import create_provider
 from market_watcher.market_hours import AlwaysOpen, USMarketHours, parse_closures
 from market_watcher.notifier import EmailNotifier, SlackNotifier
 from market_watcher.version import VERSION
+
+logger = logging.getLogger(__name__)
 
 # Prefix of a Slack incoming-webhook URL; the remainder is the secret part.
 SLACK_WEBHOOK_PREFIX = "https://hooks.slack.com/services/"
@@ -124,6 +120,8 @@ def start(stocks):
     """Starts the MarketWatcher in the foreground; stop it with Ctrl-C (or SIGTERM)."""
     echo("Starting MarketWatcher...")
 
+    data_provider = None
+    started = False
     try:
         echo(f"Reading target stocks from file: {stocks}")
         target_stocks = get_target_stocks(stocks)
@@ -154,15 +152,19 @@ def start(stocks):
         market_watcher_engine = MarketWatcherEngine(
             target_stocks=target_stocks, notifiers=notifiers, data_provider=data_provider, market_hours=market_hours
         )
-    except Exception as e:
-        raise click.ClickException(f"MarketWatcher failed to start: {e}") from e
 
-    stop_on_signals(market_watcher_engine)
-    echo("MarketWatcher started. Press Ctrl-C to stop.")
-
-    try:
+        stop_on_signals(market_watcher_engine)
+        echo("MarketWatcher started. Press Ctrl-C to stop.")
+        started = True
         market_watcher_engine.search_for_investment_opportunities()
     except Exception as e:
-        raise click.ClickException(f"MarketWatcher failed: {e}") from e
+        phase = "failed" if started else "failed to start"
+        raise click.ClickException(f"MarketWatcher {phase}: {e}") from e
+    finally:
+        if data_provider is not None:
+            try:
+                data_provider.close()
+            except Exception:
+                logger.exception("Could not close the market data provider cleanly")
 
     echo("MarketWatcher stopped.")
