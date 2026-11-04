@@ -47,13 +47,15 @@ In the next iteration of development we intend to ship more IBKR TWS API functio
 
 ## How to use MarketWatcher trading bot?
 
-After cloning the repo, copy `.env.template` to `.env` and populate it with your settings: `polling interval`, `market data provider`, `daily P&L threshold values`, `which notifiers to enable`, `email settings`, `slack channel webhook links`, ...
+After cloning the repo, copy `.env.template` to `.env` and populate it with your settings: `polling interval`, `market hours`, `market data provider`, `daily P&L threshold values`, `which notifiers to enable`, `email settings`, `slack channel webhook links`, ...
 
 Create `.yaml file with target stocks` (ticker and long/short straddle strategy indicator for that ticker). MarketWatcher engine listens to real-time ticker data feed and notifies you when there is a `potential opportunity for entering into long or short straddle options position`, with that stock as an underlying.
 
 You can control MarketWatcher trading bot using simple `CLI`. After bot is started it will send us an email/slack messages for each investment opportunity it finds.
 
 Each ticker is reported once, when its daily P&L crosses the configured threshold; it is reported again only after it has moved back inside the threshold and crossed it again. If a polling cycle fails (for example Yahoo Finance is unreachable) the error is logged and the bot retries on the next cycle. The bot runs in the foreground: stop it with `Ctrl-C` (or `SIGTERM`, which is what `docker stop` sends). It finishes the current polling cycle and exits cleanly; a second `Ctrl-C` exits immediately.
+
+The bot polls only during the NYSE regular session (09:30-16:00 New York time, Monday to Friday), skipping NYSE holidays and the 13:00 early closes (the day after Thanksgiving, and 3 July / 24 December when they fall on a Monday-Thursday); outside the session it sleeps until the next open. Because every stock shows a ~0% move right after the open, short straddle alerts are suppressed for the first `SHORT_STRADDLE_WARMUP_MINUTES` (default 30) of each session - long straddle alerts are not. The alert memory resets at each open, so a stock that qualified yesterday is reported again today. The built-in calendar is computed from the NYSE holiday rules; unscheduled closures (for example a national day of mourning) must be listed in `MARKET_HOLIDAYS` (comma-separated `YYYY-MM-DD`). Set `MARKET_HOURS_ENABLED=false` to poll around the clock.
 
 CLI commands:
 

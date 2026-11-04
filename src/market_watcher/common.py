@@ -1,11 +1,13 @@
 import logging
 import threading
+from datetime import datetime, timezone
 from enum import Enum
 
 import yaml
 
 from market_watcher.config import context
 from market_watcher.market_data import YahooFinanceProvider
+from market_watcher.market_hours import USMarketHours
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +73,17 @@ def config_flag(key, default):
     raise ValueError(f"Configuration value {key}={value!r} is not a boolean; use true or false")
 
 
+def config_int(key, default):
+    """Returns an integer configuration value, or ``default`` when it is unset."""
+    value = context.config.get(key)
+    if value is None or not value.strip():
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        raise ValueError(f"Configuration value {key}={value!r} is not an integer") from None
+
+
 def get_email_config():
     """Returns email notifier related configuration."""
     return {
@@ -105,11 +118,26 @@ class MarketWatcherEngine:
     long/short straddle opportunities."""
 
     def __init__(
-        self, target_stocks=None, notifiers=None, long_threshold=None, short_threshold=None, data_provider=None
+        self,
+        target_stocks=None,
+        notifiers=None,
+        long_threshold=None,
+        short_threshold=None,
+        data_provider=None,
+        market_hours=None,
+        short_warmup_minutes=None,
+        clock=None,
     ):
         self.target_stocks = target_stocks or {}
         self.notifiers = notifiers or []
         self.data_provider = data_provider if data_provider is not None else YahooFinanceProvider()
+        self.market_hours = market_hours if market_hours is not None else USMarketHours()
+        self.short_warmup_minutes = (
+            short_warmup_minutes
+            if short_warmup_minutes is not None
+            else config_int("SHORT_STRADDLE_WARMUP_MINUTES", default=30)
+        )
+        self._clock = clock if clock is not None else (lambda: datetime.now(timezone.utc))
 
         if long_threshold is None or short_threshold is None:
             pnl_threshold_config = get_pnl_threshold_config()
@@ -125,6 +153,9 @@ class MarketWatcherEngine:
         self._reported = {strategy.value: set() for strategy in STRATEGIES}
         # Tickers the data source returned no value for, so the warning is logged once rather than every cycle.
         self._unavailable = set()
+        # The trading day of the session currently being processed; per-session state resets when it changes.
+        self._session_day = None
+        self._short_alerts_active = False
         # Set by stop(); the polling loop waits on it so a stop request is honoured without waiting out the interval.
         self._stop_event = threading.Event()
 
@@ -143,34 +174,80 @@ class MarketWatcherEngine:
         return self._stop_event.is_set()
 
     def search_for_investment_opportunities(self):
-        """Polls the market every ``UPDATE_TIMEOUT`` seconds until :meth:`stop` is called.
+        """Polls the market every ``UPDATE_TIMEOUT`` seconds during trading sessions until :meth:`stop` is called.
 
-        The first cycle runs immediately. A failing cycle (for example the data
+        While the market is closed the loop sleeps until the next open. The first
+        cycle of a session runs immediately. A failing cycle (for example the data
         source being unreachable) is logged and retried on the next cycle instead
         of terminating the bot.
         """
         update_timeout = int(_required_config("UPDATE_TIMEOUT"))
 
         while not self._stop_event.is_set():
+            now = self._clock()
+            session = self.market_hours.current_session(now)
+            if session is None:
+                next_open = self.market_hours.next_open(now)
+                logger.info(
+                    "Market is closed; sleeping until the next session opens at %s", f"{next_open:%Y-%m-%d %H:%M %Z}"
+                )
+                # Returns as soon as stop() is called; the floor guards against a tight loop should next_open be stale.
+                self._stop_event.wait(max((next_open - now).total_seconds(), 1))
+                continue
+
+            self.begin_session(session)
             try:
-                self.process_latest_market_movements()
+                self.process_latest_market_movements(strategies=self.active_strategies(now, session))
             except Exception:
                 logger.exception("Polling cycle failed; retrying in %d seconds", update_timeout)
             # Returns as soon as stop() is called, so shutdown does not wait out the interval.
             self._stop_event.wait(update_timeout)
 
-    def process_latest_market_movements(self):
-        """Checks every target stock against the threshold of its strategy.
+    def begin_session(self, session):
+        """Resets the per-session state (alert memory, warm-up) when ``session`` is a new trading day."""
+        if session.day == self._session_day:
+            return
+        self._session_day = session.day
+        self._reported = {strategy.value: set() for strategy in STRATEGIES}
+        self._unavailable = set()
+        self._short_alerts_active = False
+        logger.info(
+            "Trading session %s: alert memory reset; short straddle alerts start %d minutes after the open",
+            session.day,
+            self.short_warmup_minutes,
+        )
 
+    def active_strategies(self, now, session):
+        """The strategies worth evaluating at ``now``.
+
+        Right after the open every stock shows a ~0% daily move, which would flood
+        the short straddle channel, so that strategy is only evaluated once
+        ``short_warmup_minutes`` have passed since the session opened.
+        """
+        minutes_since_open = (now - session.open).total_seconds() / 60
+        if minutes_since_open < self.short_warmup_minutes:
+            return {STRATEGIES.LONG_STRADDLE.value}
+        if not self._short_alerts_active:
+            self._short_alerts_active = True
+            logger.info("Short straddle alerts active (%d minutes after the open)", minutes_since_open)
+        return set(VALID_STRATEGIES)
+
+    def process_latest_market_movements(self, strategies=None):
+        """Checks the target stocks of the given ``strategies`` (default: all) against their thresholds.
+
+        Only the tickers of those strategies are requested from the data provider.
         Returns all current opportunities per strategy and notifies the subscribed
         notifiers about the ones that are new since the previous cycle, so a stock
         that stays beyond its threshold is reported once, when it crosses it,
         rather than on every cycle.
         """
-        self.daily_pnls = self.data_provider.get_daily_pnls(list(self.target_stocks))
+        strategies = VALID_STRATEGIES if strategies is None else set(strategies)
+        tickers = [ticker for ticker, settings in self.target_stocks.items() if settings["strategy"] in strategies]
+        self.daily_pnls = self.data_provider.get_daily_pnls(tickers)
 
         investment_opportunities = []
-        for ticker, settings in self.target_stocks.items():
+        for ticker in tickers:
+            settings = self.target_stocks[ticker]
             daily_pnl = self.daily_pnls.get(ticker)
             if daily_pnl is None:
                 if ticker not in self._unavailable:

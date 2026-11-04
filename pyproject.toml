@@ -15,6 +15,8 @@ dependencies = [
     "python-dotenv>=1.0",
     "PyYAML>=6.0",
     "slack-sdk>=3.27",
+    # IANA time zone data for zoneinfo on platforms without a system database (Windows, some containers).
+    "tzdata>=2024.1",
     # 1.7 (previously pinned) predates Yahoo's 2023 cookie/crumb change and no longer returns data.
     "yahoofinancials>=1.20",
 ]

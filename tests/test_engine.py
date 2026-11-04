@@ -1,9 +1,12 @@
 import threading
+import time
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from market_watcher.common import STRATEGIES, MarketWatcherEngine
 from market_watcher.market_data import MarketDataProvider
+from market_watcher.market_hours import AlwaysOpen, Session
 
 LONG = STRATEGIES.LONG_STRADDLE.value
 SHORT = STRATEGIES.SHORT_STRADDLE.value
@@ -15,6 +18,12 @@ TARGET_STOCKS = {
     "TTMI": {"strategy": SHORT},
 }
 PNLS = {"ABEO": 7.59, "ACRX": 4, "TPCO": 0.3, "TTMI": 0.6}
+
+NOW = datetime(2026, 11, 2, 15, 0, tzinfo=timezone.utc)  # 10:00 New York on a trading day
+
+
+def session_opened_at(opened):
+    return Session(day=opened.date(), open=opened, close=opened + timedelta(hours=6, minutes=30))
 
 
 class FakeProvider(MarketDataProvider):
@@ -47,11 +56,23 @@ class FailingNotifier:
         raise RuntimeError("notifier is down")
 
 
-def make_engine(pnls, notifiers=None):
-    """Engine with thresholds 5 / 0.5 fed by a FakeProvider returning ``pnls`` (see FakeProvider)."""
+def make_engine(pnls, notifiers=None, market_hours=None):
+    """Engine with thresholds 5 / 0.5 and a 30-minute warm-up, fed by a FakeProvider returning ``pnls``.
+
+    Market hours default to AlwaysOpen so tests do not depend on the wall clock.
+    """
     return MarketWatcherEngine(
-        TARGET_STOCKS, notifiers=notifiers, long_threshold=5, short_threshold=0.5, data_provider=FakeProvider(pnls)
+        TARGET_STOCKS,
+        notifiers=notifiers,
+        long_threshold=5,
+        short_threshold=0.5,
+        data_provider=FakeProvider(pnls),
+        market_hours=market_hours if market_hours is not None else AlwaysOpen(),
+        short_warmup_minutes=30,
     )
+
+
+# --- Opportunity detection -------------------------------------------------------------------------------------------
 
 
 def test_requests_every_target_ticker_from_the_provider():
@@ -131,6 +152,77 @@ def test_a_failing_notifier_does_not_block_the_others():
     engine.process_latest_market_movements()
 
     assert len(recorder.calls) == 1
+
+
+# --- Market hours ----------------------------------------------------------------------------------------------------
+
+
+def test_only_long_straddle_is_evaluated_during_the_warm_up():
+    engine = make_engine({**PNLS, "TPCO": 0.0})
+    session = session_opened_at(NOW - timedelta(minutes=10))
+
+    strategies = engine.active_strategies(NOW, session)
+    result = engine.process_latest_market_movements(strategies=strategies)
+
+    assert strategies == {LONG}
+    assert result == {LONG: {"ABEO": 7.59}, SHORT: {}}
+    # Only the long straddle tickers are fetched during the warm-up.
+    assert engine.data_provider.requested == [["ABEO", "ACRX"]]
+
+
+def test_short_straddle_is_evaluated_once_the_warm_up_is_over():
+    engine = make_engine(PNLS)
+
+    assert engine.active_strategies(NOW, session_opened_at(NOW - timedelta(minutes=30))) == {LONG, SHORT}
+
+
+def test_a_new_session_resets_the_alert_memory():
+    notifier = RecordingNotifier()
+    engine = make_engine(PNLS, notifiers=[notifier])
+
+    engine.begin_session(session_opened_at(NOW))
+    engine.process_latest_market_movements()
+    engine.begin_session(session_opened_at(NOW))  # same day: no reset
+    engine.process_latest_market_movements()
+    engine.begin_session(session_opened_at(NOW + timedelta(days=1)))
+    engine.process_latest_market_movements()
+
+    assert len(notifier.calls) == 2
+
+
+class ClosedMarket:
+    """Market hours that are always closed, counting how often the engine asks for the next open."""
+
+    def __init__(self):
+        self.next_open_calls = 0
+
+    def current_session(self, now):
+        return None
+
+    def next_open(self, now):
+        self.next_open_calls += 1
+        return now + timedelta(hours=1)
+
+
+def test_polling_loop_sleeps_without_fetching_while_the_market_is_closed(monkeypatch):
+    monkeypatch.setattr("market_watcher.common.context", FakeContext())
+    market = ClosedMarket()
+    engine = make_engine(PNLS, market_hours=market)
+    worker = threading.Thread(target=engine.search_for_investment_opportunities, daemon=True)
+
+    worker.start()
+    deadline = time.time() + 5
+    while market.next_open_calls == 0 and time.time() < deadline:
+        time.sleep(0.01)
+    engine.stop()
+    worker.join(timeout=5)
+
+    assert not worker.is_alive(), "stop() did not interrupt the sleep until the next open"
+    assert market.next_open_calls == 1
+    assert engine.data_provider.requested == []
+
+
+# --- Polling loop ----------------------------------------------------------------------------------------------------
 
 
 class FakeContext:

@@ -1,6 +1,6 @@
 import pytest
 
-from market_watcher.common import config_flag
+from market_watcher.common import config_flag, config_int
 
 
 class FakeContext:
@@ -14,6 +14,9 @@ def set_config(monkeypatch):
         monkeypatch.setattr("market_watcher.common.context", FakeContext(**config))
 
     return _set
+
+
+# --- config_flag -----------------------------------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("value", ["true", "True", " TRUE ", "yes", "on", "1"])
@@ -31,7 +34,7 @@ def test_falsy_values(set_config, value):
 
 
 @pytest.mark.parametrize("config", [{}, {"FLAG": ""}, {"FLAG": "   "}])
-def test_unset_or_blank_value_uses_the_default(set_config, config):
+def test_unset_or_blank_flag_uses_the_default(set_config, config):
     set_config(**config)
 
     assert config_flag("FLAG", default=True) is True
@@ -43,3 +46,28 @@ def test_non_boolean_value_raises(set_config):
 
     with pytest.raises(ValueError, match="FLAG"):
         config_flag("FLAG", default=True)
+
+
+# --- config_int ------------------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(("value", "expected"), [("30", 30), (" 0 ", 0), ("-5", -5)])
+def test_integer_values(set_config, value, expected):
+    set_config(MINUTES=value)
+
+    assert config_int("MINUTES", default=99) == expected
+
+
+@pytest.mark.parametrize("config", [{}, {"MINUTES": ""}, {"MINUTES": "  "}])
+def test_unset_or_blank_int_uses_the_default(set_config, config):
+    set_config(**config)
+
+    assert config_int("MINUTES", default=30) == 30
+
+
+@pytest.mark.parametrize("value", ["thirty", "30.5", "1e3"])
+def test_non_integer_value_raises(set_config, value):
+    set_config(MINUTES=value)
+
+    with pytest.raises(ValueError, match="MINUTES"):
+        config_int("MINUTES", default=30)

@@ -12,7 +12,9 @@ from market_watcher.common import (
     get_slack_config,
     get_target_stocks,
 )
+from market_watcher.config import context
 from market_watcher.market_data import create_provider
+from market_watcher.market_hours import AlwaysOpen, USMarketHours, parse_closures
 from market_watcher.notifier import EmailNotifier, SlackNotifier
 from market_watcher.version import VERSION
 
@@ -129,6 +131,13 @@ def start(stocks):
         data_provider = create_provider()
         echo(f"Using market data provider: {data_provider.name}")
 
+        if config_flag("MARKET_HOURS_ENABLED", default=True):
+            market_hours = USMarketHours(extra_closures=parse_closures(context.config.get("MARKET_HOLIDAYS")))
+            echo("Polling during NYSE regular trading hours only (MARKET_HOURS_ENABLED=false polls around the clock).")
+        else:
+            market_hours = AlwaysOpen()
+            echo("Market-hours gating disabled: polling around the clock.")
+
         notifiers = []
 
         if config_flag("EMAIL_NOTIFIER_ENABLED", default=True):
@@ -143,7 +152,7 @@ def start(stocks):
             echo("Warning: both notifiers are disabled; opportunities will only be logged.")
 
         market_watcher_engine = MarketWatcherEngine(
-            target_stocks=target_stocks, notifiers=notifiers, data_provider=data_provider
+            target_stocks=target_stocks, notifiers=notifiers, data_provider=data_provider, market_hours=market_hours
         )
     except Exception as e:
         raise click.ClickException(f"MarketWatcher failed to start: {e}") from e

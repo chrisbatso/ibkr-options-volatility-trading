@@ -5,6 +5,7 @@ from click.testing import CliRunner
 
 from market_watcher import market_watcher_cli
 from market_watcher.common import context
+from market_watcher.market_hours import AlwaysOpen, USMarketHours
 
 
 def test_help_lists_the_commands():
@@ -93,6 +94,8 @@ def start_environment(monkeypatch, tmp_path):
     """Config and stubs that let `start` run without notifiers, signals or a real polling loop."""
     for key, value in {
         "MARKET_DATA_PROVIDER": "yahoo",
+        "MARKET_HOURS_ENABLED": "true",
+        "MARKET_HOLIDAYS": "",
         "EMAIL_NOTIFIER_ENABLED": "false",
         "SLACK_NOTIFIER_ENABLED": "false",
         "LONG_THRESHOLD": "0.02",
@@ -124,10 +127,35 @@ def test_start_runs_the_engine_and_exits_cleanly(start_environment):
     assert engine.target_stocks == {"AAPL": {"strategy": "short straddle"}}
     assert engine.notifiers == []
     assert engine.data_provider.name == "yahoo"
+    assert isinstance(engine.market_hours, USMarketHours)
     assert "Using market data provider: yahoo" in result.output
+    assert "NYSE regular trading hours" in result.output
     assert "both notifiers are disabled" in result.output
     assert "MarketWatcher started." in result.output
     assert "MarketWatcher stopped." in result.output
+
+
+def test_start_can_poll_around_the_clock(start_environment, monkeypatch):
+    stocks, engines_run = start_environment
+    monkeypatch.setitem(context.config, "MARKET_HOURS_ENABLED", "false")
+
+    result = CliRunner().invoke(market_watcher_cli.cli, ["start", "--stocks", str(stocks)])
+
+    assert result.exit_code == 0, result.output
+    [engine] = engines_run
+    assert isinstance(engine.market_hours, AlwaysOpen)
+    assert "polling around the clock" in result.output
+
+
+def test_start_fails_clearly_on_a_malformed_market_holiday(start_environment, monkeypatch):
+    stocks, engines_run = start_environment
+    monkeypatch.setitem(context.config, "MARKET_HOLIDAYS", "2026-01-09, next tuesday")
+
+    result = CliRunner().invoke(market_watcher_cli.cli, ["start", "--stocks", str(stocks)])
+
+    assert result.exit_code == 1
+    assert "MARKET_HOLIDAYS entry 'next tuesday'" in result.output
+    assert engines_run == []
 
 
 def test_start_fails_clearly_when_the_stocks_file_is_missing(start_environment, tmp_path):
