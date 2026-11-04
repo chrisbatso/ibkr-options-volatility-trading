@@ -267,6 +267,26 @@ def test_polling_loop_survives_a_failing_cycle(monkeypatch):
     assert engine.stopping
 
 
+def test_cycle_hooks_run_after_every_cycle_and_a_failing_hook_is_isolated(monkeypatch):
+    monkeypatch.setattr("market_watcher.common.context", FakeContext())
+    calls = []
+
+    def failing_hook(now, session):
+        raise RuntimeError("hook is down")
+
+    def recording_hook(now, session):
+        calls.append((now, session))
+
+    engine = make_engine(PNLS)
+    engine.cycle_hooks = [failing_hook, recording_hook]
+    engine.notifiers.append(StopOnNotify(engine))
+
+    engine.search_for_investment_opportunities()
+
+    [(now, session)] = calls
+    assert now.tzinfo is not None and session.day == now.astimezone(session.open.tzinfo).date()
+
+
 def test_polling_loop_returns_at_once_when_stopped_before_it_starts(monkeypatch):
     """A stop request that arrives during start-up must not be lost."""
     monkeypatch.setattr("market_watcher.common.context", FakeContext())

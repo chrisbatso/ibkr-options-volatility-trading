@@ -99,9 +99,12 @@ class MarketWatcherEngine:
         market_hours=None,
         short_warmup_minutes=None,
         clock=None,
+        cycle_hooks=None,
     ):
         self.target_stocks = target_stocks or {}
         self.notifiers = notifiers or []
+        # Called as hook(now, session) at the end of every polling cycle, e.g. to manage open positions.
+        self.cycle_hooks = list(cycle_hooks or [])
         self.data_provider = data_provider if data_provider is not None else YahooFinanceProvider()
         self.market_hours = market_hours if market_hours is not None else USMarketHours()
         self.short_warmup_minutes = (
@@ -172,8 +175,17 @@ class MarketWatcherEngine:
                 self.process_latest_market_movements(strategies=self.active_strategies(now, session))
             except Exception:
                 logger.exception("Polling cycle failed; retrying in %d seconds", update_timeout)
+            self.run_cycle_hooks(session)
             # Returns as soon as stop() is called, so shutdown does not wait out the interval.
             self._stop_event.wait(update_timeout)
+
+    def run_cycle_hooks(self, session):
+        """Calls every cycle hook with the current time and session; a failing hook is logged and skipped."""
+        for hook in self.cycle_hooks:
+            try:
+                hook(self._clock(), session)
+            except Exception:
+                logger.exception("Cycle hook %s failed", getattr(hook, "__qualname__", repr(hook)))
 
     def begin_session(self, session):
         """Resets the per-session state (alert memory, warm-up) when ``session`` is a new trading day."""

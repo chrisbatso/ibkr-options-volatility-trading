@@ -1,29 +1,41 @@
 import math
 import sys
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
-from ib_async import OptionChain
+from ib_async import Option, OptionChain
 
 from market_watcher.config import context
+from market_watcher.market_hours import Session
 from market_watcher.trading import (
+    EXIT_REF,
     LONG,
+    ORDER_REF,
     SHORT,
     IBKRStraddleTrader,
+    OpenStraddle,
+    StraddleQuote,
     StraddleSpec,
     TradingSettings,
     check_limits,
     choose_expiry,
+    exit_limit,
+    exit_reason,
     limit_price,
     option_price,
     parse_strategies,
     select_chain,
+    straddle_quote,
     strikes_by_distance,
+    unrealized_pnl,
 )
 
 TODAY = date(2026, 11, 4)
+NOW = datetime(2026, 11, 4, 15, 0, tzinfo=timezone.utc)  # 10:00 New York
+SESSION = Session(day=TODAY, open=NOW - timedelta(minutes=30), close=NOW + timedelta(hours=6))
+NEAR_CLOSE = SESSION.close - timedelta(minutes=10)
 
 
 @dataclass
@@ -35,14 +47,21 @@ class Snapshot:
 
 
 class FakeTrade:
-    def __init__(self, order, order_id):
+    def __init__(self, order, order_id, status="PendingSubmit"):
         order.orderId = order_id
         self.order = order
-        self.orderStatus = SimpleNamespace(status="PreSubmitted")
+        self.orderStatus = SimpleNamespace(status=status, avgFillPrice=0.0)
+
+    def fill(self, price):
+        self.orderStatus.status = "Filled"
+        self.orderStatus.avgFillPrice = price
+
+    def cancel(self):
+        self.orderStatus.status = "Cancelled"
 
 
 class FakeIB:
-    """TWS stand-in: a few stocks at 101.30, one option chain with strikes 95/100/105, quotes per leg."""
+    """TWS stand-in: a few stocks at 101.30, one option chain with strikes 95/100/105, quotes per leg, an order book."""
 
     instances = []
     accounts = ["DU1234567"]
@@ -51,11 +70,15 @@ class FakeIB:
     available_strikes = {95.0, 100.0, 105.0}
     quotes = {}
     chains = []
+    executions = []
+    held = []
 
     def __init__(self):
         self.connected = False
         self.calls = []
         self.orders = []
+        self.trade_objects = []
+        self.cancelled = []
         FakeIB.instances.append(self)
 
     def connect(self, host, port, clientId, timeout, readonly):  # noqa: N803 - ib_async's keyword
@@ -97,7 +120,24 @@ class FakeIB:
 
     def placeOrder(self, contract, order):  # noqa: N802
         self.orders.append((contract, order))
-        return FakeTrade(order, len(self.orders))
+        trade = FakeTrade(order, len(self.orders))
+        self.trade_objects.append(trade)
+        return trade
+
+    def trades(self):
+        return list(self.trade_objects)
+
+    def cancelOrder(self, order):  # noqa: N802
+        self.cancelled.append(order.orderId)
+        for trade in self.trade_objects:
+            if trade.order.orderId == order.orderId:
+                trade.cancel()
+
+    def positions(self):
+        return list(FakeIB.held)
+
+    def reqExecutions(self):  # noqa: N802
+        return list(FakeIB.executions)
 
 
 DEFAULT_QUOTES = {
@@ -109,6 +149,12 @@ DEFAULT_QUOTES = {
 DEFAULT_CHAINS = [OptionChain("SMART", 1, "AAPL", "100", ["20261106", "20261120", "20261218"], [95.0, 100.0, 105.0])]
 
 
+def quote_atm(call_bid, call_ask, put_bid, put_ask):
+    """Re-quotes the 100 strike; the straddle mid is (call + put mids)."""
+    FakeIB.quotes[("C", 100.0)] = Snapshot(bid=call_bid, ask=call_ask)
+    FakeIB.quotes[("P", 100.0)] = Snapshot(bid=put_bid, ask=put_ask)
+
+
 @pytest.fixture
 def fake_ib():
     FakeIB.instances = []
@@ -118,6 +164,8 @@ def fake_ib():
     FakeIB.available_strikes = {95.0, 100.0, 105.0}
     FakeIB.quotes = dict(DEFAULT_QUOTES)
     FakeIB.chains = list(DEFAULT_CHAINS)
+    FakeIB.executions = []
+    FakeIB.held = []
     return FakeIB
 
 
@@ -126,7 +174,14 @@ def make_trader(**overrides):
     return IBKRStraddleTrader(settings, ib_factory=FakeIB, today=lambda: TODAY)
 
 
-# --- Orders ----------------------------------------------------------------------------------------------------------
+def open_long(**overrides):
+    """A trader with one long AAPL straddle placed (entry limit 6.12); returns it with its FakeIB."""
+    trader = make_trader(**overrides)
+    trader.place_straddle("AAPL", LONG)
+    return trader, FakeIB.instances[-1]
+
+
+# --- Entries ---------------------------------------------------------------------------------------------------------
 
 
 def test_long_straddle_is_one_combo_limit_order_bought_at_the_money(fake_ib):
@@ -145,7 +200,7 @@ def test_long_straddle_is_one_combo_limit_order_bought_at_the_money(fake_ib):
     assert contract.secType == "BAG" and contract.symbol == "AAPL"
     assert [(leg.conId, leg.action, leg.ratio) for leg in contract.comboLegs] == [(1001, "BUY", 1), (1002, "BUY", 1)]
     assert (order.action, order.totalQuantity, order.lmtPrice) == ("BUY", 1, 6.12)
-    assert (order.tif, order.transmit, order.orderRef) == ("DAY", False, "MarketWatcher")
+    assert (order.tif, order.transmit, order.orderRef) == ("DAY", False, ORDER_REF)
 
 
 def test_short_straddle_sells_the_combo_below_mid(fake_ib):
@@ -181,6 +236,14 @@ def test_notional_cap_blocks_large_short_straddles(fake_ib):
     assert fake_ib.instances[0].orders == []
 
 
+def test_risk_per_trade_sizes_long_straddles_by_premium(fake_ib):
+    spec = make_trader(contracts=5, risk_per_trade=2_000, max_premium=10_000).place_straddle("AAPL", LONG)
+    assert spec.quantity == 3  # 2,000 / 612 per contract, capped by STRADDLE_CONTRACTS = 5
+
+    with pytest.raises(ValueError, match="buys no contract"):
+        make_trader(risk_per_trade=500).place_straddle("MSFT", LONG)
+
+
 def test_refuses_to_trade_on_a_live_account_unless_allowed(fake_ib):
     fake_ib.accounts = ["U7654321"]
 
@@ -204,7 +267,7 @@ def test_notify_trades_only_enabled_strategies_and_isolates_failures(fake_ib):
 
 
 def test_one_order_per_ticker_per_day_and_a_daily_cap(fake_ib):
-    trader = make_trader(max_orders_per_day=2)
+    trader = make_trader(max_orders_per_day=2, max_open_positions=10)
 
     assert trader.place_straddle("AAPL", LONG) is not None
     assert trader.place_straddle("AAPL", LONG) is None  # same ticker again today
@@ -214,12 +277,21 @@ def test_one_order_per_ticker_per_day_and_a_daily_cap(fake_ib):
     assert len(fake_ib.instances[0].orders) == 2
 
 
+def test_max_open_positions_blocks_new_entries(fake_ib):
+    trader = make_trader(max_open_positions=1)
+
+    assert trader.place_straddle("AAPL", LONG) is not None
+    assert trader.place_straddle("MSFT", LONG) is None
+    assert len(fake_ib.instances[0].orders) == 1
+
+
 def test_the_daily_memory_resets_on_a_new_day(fake_ib):
     days = iter([TODAY, TODAY, TODAY + timedelta(days=1)])
     trader = IBKRStraddleTrader(TradingSettings(enabled=True), ib_factory=FakeIB, today=lambda: next(days))
 
     assert trader.place_straddle("AAPL", LONG) is not None
     assert trader.place_straddle("AAPL", LONG) is None
+    trader.positions.clear()  # the first straddle was closed meanwhile
     assert trader.place_straddle("AAPL", LONG) is not None
 
 
@@ -227,7 +299,9 @@ def test_dry_run_builds_the_order_but_sends_nothing(fake_ib):
     spec = make_trader(dry_run=True).place_straddle("AAPL", LONG)
 
     assert spec is not None and spec.limit_price == pytest.approx(6.12)
-    assert fake_ib.instances[0].orders == []
+    [ib] = fake_ib.instances
+    assert ib.orders == []
+    assert ib.calls[0][-1] is True  # a dry run only needs a read-only connection
 
 
 def test_transmit_flag_is_passed_to_the_order(fake_ib):
@@ -257,6 +331,212 @@ def test_explains_the_missing_optional_dependency(monkeypatch):
 
     with pytest.raises(RuntimeError, match=r'pip install "market_watcher\[ibkr\]"'):
         trader.place_straddle("AAPL", LONG)
+
+
+# --- Position management ---------------------------------------------------------------------------------------------
+
+
+def test_entry_is_pending_until_ib_reports_the_fill(fake_ib):
+    trader, ib = open_long()
+
+    trader.manage_positions(NOW, SESSION)
+    [position] = trader.positions.values()
+    assert not position.filled and position.entry_price == pytest.approx(6.12)
+    assert len(ib.orders) == 1  # a pending entry is never "exited"
+
+    ib.trade_objects[0].fill(6.05)
+    trader.manage_positions(NOW, SESSION)
+    assert position.filled and position.entry_price == 6.05
+
+
+def test_cancelled_or_rejected_entry_is_forgotten(fake_ib):
+    trader, ib = open_long()
+    ib.trade_objects[0].cancel()
+
+    trader.manage_positions(NOW, SESSION)
+
+    assert trader.positions == {}
+
+
+def test_no_exit_while_the_value_stays_inside_the_band(fake_ib):
+    trader, ib = open_long()
+    ib.trade_objects[0].fill(6.0)
+
+    trader.manage_positions(NOW, SESSION)  # still quoted at a 6.00 mid
+
+    assert len(ib.orders) == 1
+    assert trader.positions["AAPL"].exit_order_id is None
+
+
+def test_take_profit_sells_the_same_combo_a_little_below_mid(fake_ib):
+    trader, ib = open_long()
+    ib.trade_objects[0].fill(6.0)
+    quote_atm(5.0, 5.2, 4.0, 4.2)  # straddle mid 9.20 >= 6.00 * 1.5
+
+    trader.manage_positions(NOW, SESSION)
+
+    [(entry_contract, _), (exit_contract, exit_order)] = ib.orders
+    assert exit_contract is entry_contract
+    assert (exit_order.action, exit_order.totalQuantity, exit_order.orderRef, exit_order.transmit) == (
+        "SELL",
+        1,
+        EXIT_REF,
+        False,
+    )
+    assert exit_order.lmtPrice == pytest.approx(round(9.2 * 0.98, 2))
+    position = trader.positions["AAPL"]
+    assert position.exit_order_id == 2 and position.exit_reason.startswith("take profit")
+
+
+def test_stop_loss_crosses_the_spread(fake_ib):
+    trader, ib = open_long()
+    ib.trade_objects[0].fill(6.0)
+    quote_atm(1.4, 1.5, 1.4, 1.5)  # mid 2.90 <= 3.00; straddle bid 2.80
+
+    trader.manage_positions(NOW, SESSION)
+
+    [_, (_, exit_order)] = ib.orders
+    assert exit_order.action == "SELL" and exit_order.lmtPrice == pytest.approx(2.8)
+    assert trader.positions["AAPL"].exit_reason.startswith("stop loss")
+
+
+def test_positions_are_closed_before_the_session_close_unless_held_overnight(fake_ib):
+    trader, ib = open_long()
+    ib.trade_objects[0].fill(6.0)
+
+    trader.manage_positions(NEAR_CLOSE, SESSION)
+
+    [_, (_, exit_order)] = ib.orders
+    assert exit_order.lmtPrice == pytest.approx(5.8)  # straddle bid 3.0 + 2.8: marketable
+    assert trader.positions["AAPL"].exit_reason == "session close"
+
+    overnight, ib2 = open_long(hold_overnight=True)
+    ib2.trade_objects[0].fill(6.0)
+    overnight.manage_positions(NEAR_CLOSE, SESSION)
+    assert len(ib2.orders) == 1
+
+
+def test_unfilled_entries_are_cancelled_at_the_session_close(fake_ib):
+    trader, ib = open_long()
+
+    trader.manage_positions(NEAR_CLOSE, SESSION)
+
+    assert ib.cancelled == [1]
+    assert trader.positions == {}
+
+
+def test_exit_fill_realizes_the_pnl_and_frees_the_slot(fake_ib):
+    trader, ib = open_long(max_open_positions=1)
+    ib.trade_objects[0].fill(6.0)
+    quote_atm(5.0, 5.2, 4.0, 4.2)
+    trader.manage_positions(NOW, SESSION)  # places the take-profit exit
+    ib.trade_objects[1].fill(9.1)
+
+    trader.manage_positions(NOW, SESSION)
+
+    assert trader.positions == {}
+    assert trader.realized_today(TODAY) == pytest.approx((9.1 - 6.0) * 100)
+    assert trader.place_straddle("MSFT", LONG) is not None  # the slot is free again
+
+
+def test_cancelled_exit_is_placed_again(fake_ib):
+    trader, ib = open_long()
+    ib.trade_objects[0].fill(6.0)
+    quote_atm(5.0, 5.2, 4.0, 4.2)
+    trader.manage_positions(NOW, SESSION)
+    ib.trade_objects[1].cancel()
+
+    trader.manage_positions(NOW, SESSION)
+
+    assert len(ib.orders) == 3
+    assert trader.positions["AAPL"].exit_order_id == 3
+
+
+def test_daily_loss_limit_closes_everything_and_halts_new_entries(fake_ib):
+    trader = make_trader(max_daily_loss=100)
+    trader.place_straddle("AAPL", LONG)
+    [ib] = fake_ib.instances
+    ib.trade_objects[0].fill(6.0)
+    quote_atm(2.4, 2.5, 2.4, 2.5)  # mid 4.90: -110 USD unrealized, inside the stop-loss band but past the daily limit
+
+    trader.manage_positions(NOW, SESSION)
+
+    [_, (_, exit_order)] = ib.orders
+    assert exit_order.action == "SELL" and exit_order.lmtPrice == pytest.approx(4.8)  # crosses the spread
+    assert trader.positions["AAPL"].exit_reason == "daily loss limit"
+    assert trader.place_straddle("MSFT", LONG) is None
+    assert len(ib.orders) == 2
+
+
+def test_short_straddle_is_bought_back_on_take_profit(fake_ib):
+    trader = make_trader(strategies=frozenset({SHORT}))
+    trader.place_straddle("AAPL", SHORT)
+    [ib] = fake_ib.instances
+    ib.trade_objects[0].fill(5.9)
+    quote_atm(1.4, 1.5, 1.4, 1.5)  # mid 2.90 <= 5.90 * 0.5
+
+    trader.manage_positions(NOW, SESSION)
+
+    [_, (_, exit_order)] = ib.orders
+    assert exit_order.action == "BUY" and exit_order.lmtPrice == pytest.approx(round(2.9 * 1.02, 2))
+
+
+def test_dry_run_rehearses_exits_without_sending_orders(fake_ib):
+    trader = make_trader(dry_run=True)
+    trader.place_straddle("AAPL", LONG)  # recorded as filled at the limit, 6.12
+    quote_atm(5.0, 5.2, 4.0, 4.2)
+
+    trader.manage_positions(NOW, SESSION)
+
+    [ib] = fake_ib.instances
+    assert ib.orders == []
+    assert trader.positions == {}
+    assert trader.realized_today(TODAY) == pytest.approx((round(9.2 * 0.98, 2) - 6.12) * 100)
+
+
+def execution(con_id, right, order_id, price, side="BOT", shares=1, ref=ORDER_REF):
+    contract = Option("AAPL", "20261120", 100.0, right, "SMART", multiplier="100", currency="USD")
+    contract.conId = con_id
+    return SimpleNamespace(
+        contract=contract,
+        execution=SimpleNamespace(orderId=order_id, orderRef=ref, side=side, shares=shares, price=price),
+    )
+
+
+def test_the_book_is_rebuilt_from_todays_executions_after_a_restart(fake_ib):
+    fake_ib.executions = [
+        execution(1001, "C", 7, 3.05),
+        execution(1002, "P", 7, 2.95),
+        execution(1051, "C", 8, 1.0, ref="something else"),  # not ours
+    ]
+    fake_ib.held = [
+        SimpleNamespace(contract=SimpleNamespace(conId=1001), position=1),
+        SimpleNamespace(contract=SimpleNamespace(conId=1002), position=1),
+    ]
+    trader = make_trader()
+
+    trader.manage_positions(NOW, SESSION)
+
+    [position] = trader.positions.values()
+    assert position.filled and position.entry_order_id is None
+    assert position.entry_price == pytest.approx(6.0)
+    assert (position.spec.ticker, position.spec.action, position.spec.strategy) == ("AAPL", "BUY", LONG)
+    assert [leg.conId for leg in position.spec.contract.comboLegs] == [1001, 1002]
+
+    quote_atm(5.0, 5.2, 4.0, 4.2)
+    trader.manage_positions(NOW, SESSION)
+    [(exit_contract, exit_order)] = fake_ib.instances[0].orders
+    assert exit_order.action == "SELL" and exit_contract.comboLegs[0].conId == 1001
+
+
+def test_rebuild_skips_straddles_no_longer_held(fake_ib):
+    fake_ib.executions = [execution(1001, "C", 7, 3.05), execution(1002, "P", 7, 2.95)]
+    fake_ib.held = []
+
+    trader = make_trader()
+    trader.manage_positions(NOW, SESSION)
+
+    assert trader.positions == {}
 
 
 # --- Pure helpers ----------------------------------------------------------------------------------------------------
@@ -294,13 +574,29 @@ def test_option_price_prefers_the_midpoint():
     assert option_price(Snapshot(bid=1.0)) is None
 
 
+def test_straddle_quote_sums_the_legs():
+    quote = straddle_quote(Snapshot(bid=3.0, ask=3.2), Snapshot(bid=2.8, ask=3.0))
+    assert (quote.mid, quote.bid, quote.ask) == (pytest.approx(6.0), pytest.approx(5.8), pytest.approx(6.2))
+
+    one_sided = straddle_quote(Snapshot(last=3.0), Snapshot(bid=2.8, ask=3.0))
+    assert one_sided.mid == pytest.approx(5.9) and one_sided.bid is None and one_sided.ask is None
+    assert straddle_quote(Snapshot(), Snapshot(bid=2.8, ask=3.0)) is None
+
+
 def test_limit_price_applies_the_buffer_in_the_right_direction():
     assert limit_price(6.0, "BUY", 2.0) == 6.12
     assert limit_price(6.0, "SELL", 2.0) == 5.88
 
 
 def spec(action, limit, strike=100.0, quantity=1):
-    return StraddleSpec("AAPL", LONG, action, "20261120", strike, 101.3, 3.1, 2.9, limit, quantity, 100, None)
+    strategy = LONG if action == "BUY" else SHORT
+    return StraddleSpec("AAPL", strategy, action, "20261120", strike, 101.3, 3.1, 2.9, limit, quantity, 100, None)
+
+
+def position(action, entry):
+    return OpenStraddle(
+        spec=spec(action, entry), call=None, put=None, entry_order_id=1, entry_price=entry, filled=True, opened_on=TODAY
+    )
 
 
 def test_check_limits():
@@ -312,6 +608,49 @@ def test_check_limits():
         check_limits(spec("BUY", 10.01), settings)
     with pytest.raises(ValueError, match="notional"):
         check_limits(spec("SELL", 6.0, strike=200.5), settings)
+
+
+def test_unrealized_pnl_has_the_right_sign_for_each_side():
+    assert unrealized_pnl(position("BUY", 6.0), 6.5) == pytest.approx(50.0)
+    assert unrealized_pnl(position("SELL", 6.0), 6.5) == pytest.approx(-50.0)
+
+
+@pytest.mark.parametrize(
+    ("action", "entry", "value", "now", "expected"),
+    [
+        ("BUY", 6.0, 9.0, NOW, "take profit"),
+        ("BUY", 6.0, 8.99, NOW, None),
+        ("BUY", 6.0, 3.0, NOW, "stop loss"),
+        ("BUY", 6.0, 3.01, NOW, None),
+        ("SELL", 6.0, 3.0, NOW, "take profit"),
+        ("SELL", 6.0, 9.0, NOW, "stop loss"),
+        ("BUY", 6.0, 6.0, SESSION.close - timedelta(minutes=15), "session close"),
+        ("BUY", 6.0, 6.0, SESSION.close - timedelta(minutes=16), None),
+    ],
+)
+def test_exit_reason(action, entry, value, now, expected):
+    reason = exit_reason(position(action, entry), value, now, SESSION, TradingSettings())
+
+    assert (reason or "").startswith(expected or "") if expected else reason is None
+
+
+def test_exit_rules_can_be_disabled():
+    settings = TradingSettings(take_profit_pct=0, stop_loss_pct=0, hold_overnight=True)
+
+    assert exit_reason(position("BUY", 6.0), 60.0, NEAR_CLOSE, SESSION, settings) is None
+    assert exit_reason(position("BUY", 6.0), 0.01, NEAR_CLOSE, SESSION, settings) is None
+
+
+def test_exit_limit_is_gentle_on_profits_and_marketable_otherwise():
+    quote = StraddleQuote(mid=9.0, bid=8.8, ask=9.2)
+    long = position("BUY", 6.0)
+    short = position("SELL", 6.0)
+
+    assert exit_limit(long, quote, "take profit", 2.0) == pytest.approx(8.82)
+    assert exit_limit(long, quote, "stop loss", 2.0) == pytest.approx(8.8)
+    assert exit_limit(short, quote, "take profit", 2.0) == pytest.approx(9.18)
+    assert exit_limit(short, quote, "session close", 2.0) == pytest.approx(9.2)
+    assert exit_limit(long, StraddleQuote(mid=9.0, bid=None, ask=None), "stop loss", 2.0) == pytest.approx(8.82)
 
 
 def test_spec_describe_reads_like_an_order_ticket():
@@ -343,6 +682,13 @@ TRADING_KEYS = (
     "STRADDLE_MIN_DAYS_TO_EXPIRY",
     "STRADDLE_LIMIT_BUFFER_PCT",
     "TRADING_MAX_ORDERS_PER_DAY",
+    "TRADING_TAKE_PROFIT_PCT",
+    "TRADING_STOP_LOSS_PCT",
+    "TRADING_EXIT_MINUTES_BEFORE_CLOSE",
+    "TRADING_HOLD_OVERNIGHT",
+    "TRADING_MAX_OPEN_POSITIONS",
+    "TRADING_MAX_DAILY_LOSS",
+    "STRADDLE_RISK_PER_TRADE",
     "IBKR_HOST",
     "IBKR_PORT",
     "IBKR_TRADING_CLIENT_ID",
@@ -360,7 +706,18 @@ def test_settings_are_cautious_by_default(monkeypatch):
     assert settings == TradingSettings()
     assert (settings.enabled, settings.transmit, settings.allow_live, settings.dry_run) == (False, False, False, False)
     assert settings.strategies == frozenset({LONG})
-    assert "staged in TWS" in settings.describe() and "paper accounts only" in settings.describe()
+    assert (settings.take_profit_pct, settings.stop_loss_pct, settings.exit_minutes_before_close) == (50.0, 50.0, 15)
+    assert (settings.hold_overnight, settings.max_open_positions, settings.max_daily_loss, settings.risk_per_trade) == (
+        False,
+        3,
+        500.0,
+        0.0,
+    )
+    description = settings.describe()
+    assert "staged in TWS" in description and "paper accounts only" in description
+    assert (
+        "take profit 50%" in description and "stop loss 50%" in description and "15 min before the close" in description
+    )
 
 
 def test_settings_are_read_from_the_configuration(monkeypatch):
@@ -376,6 +733,13 @@ def test_settings_are_read_from_the_configuration(monkeypatch):
         "STRADDLE_MIN_DAYS_TO_EXPIRY": "14",
         "STRADDLE_LIMIT_BUFFER_PCT": "1.5",
         "TRADING_MAX_ORDERS_PER_DAY": "5",
+        "TRADING_TAKE_PROFIT_PCT": "40",
+        "TRADING_STOP_LOSS_PCT": "30",
+        "TRADING_EXIT_MINUTES_BEFORE_CLOSE": "20",
+        "TRADING_HOLD_OVERNIGHT": "true",
+        "TRADING_MAX_OPEN_POSITIONS": "4",
+        "TRADING_MAX_DAILY_LOSS": "750",
+        "STRADDLE_RISK_PER_TRADE": "1200",
         "IBKR_HOST": "gateway",
         "IBKR_PORT": "4002",
         "IBKR_TRADING_CLIENT_ID": "9",
@@ -399,6 +763,13 @@ def test_settings_are_read_from_the_configuration(monkeypatch):
         min_days_to_expiry=14,
         limit_buffer_pct=1.5,
         max_orders_per_day=5,
+        take_profit_pct=40.0,
+        stop_loss_pct=30.0,
+        exit_minutes_before_close=20,
+        hold_overnight=True,
+        max_open_positions=4,
+        max_daily_loss=750.0,
+        risk_per_trade=1200.0,
         host="gateway",
         port=4002,
         client_id=9,
@@ -408,8 +779,11 @@ def test_settings_are_read_from_the_configuration(monkeypatch):
     assert "DRY RUN" in settings.describe() and "live accounts allowed" in settings.describe()
 
 
-@pytest.mark.parametrize(("key", "value"), [("STRADDLE_CONTRACTS", "0"), ("TRADING_MAX_ORDERS_PER_DAY", "0")])
-def test_settings_reject_zero_contracts_or_orders(monkeypatch, key, value):
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [("STRADDLE_CONTRACTS", "0"), ("TRADING_MAX_ORDERS_PER_DAY", "0"), ("TRADING_MAX_OPEN_POSITIONS", "0")],
+)
+def test_settings_reject_zero_contracts_orders_or_positions(monkeypatch, key, value):
     monkeypatch.setitem(context.config, key, value)
 
     with pytest.raises(ValueError, match=key):

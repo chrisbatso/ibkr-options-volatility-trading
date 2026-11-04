@@ -245,6 +245,7 @@ def test_start_adds_the_trader_when_order_placement_is_enabled(start_environment
     [trader] = engine.notifiers
     assert isinstance(trader, IBKRStraddleTrader)
     assert trader.settings.enabled and not trader.settings.transmit and not trader.settings.allow_live
+    assert engine.cycle_hooks == [trader.manage_positions]
     assert "Order placement ENABLED: staged in TWS; paper accounts only; long straddle" in result.output
 
 

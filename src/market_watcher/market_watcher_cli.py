@@ -201,17 +201,23 @@ def start(stocks):
         if not notifiers:
             echo("Warning: both notifiers are disabled; opportunities will only be logged.")
 
+        cycle_hooks = []
         trading = TradingSettings.from_config()
         if trading.enabled:
             trader = IBKRStraddleTrader(trading)
             notifiers.append(trader)
             closers.append(trader)
+            cycle_hooks.append(trader.manage_positions)
             echo(f"Order placement ENABLED: {trading.describe()}")
         else:
             echo("Order placement disabled (TRADING_ENABLED=false).")
 
         market_watcher_engine = MarketWatcherEngine(
-            target_stocks=target_stocks, notifiers=notifiers, data_provider=data_provider, market_hours=market_hours
+            target_stocks=target_stocks,
+            notifiers=notifiers,
+            data_provider=data_provider,
+            market_hours=market_hours,
+            cycle_hooks=cycle_hooks,
         )
 
         stop_on_signals(market_watcher_engine)
