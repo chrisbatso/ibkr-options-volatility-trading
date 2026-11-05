@@ -14,7 +14,7 @@ def test_help_lists_the_commands():
     assert result.exit_code == 0
     commands_section = result.output.split("Commands:")[1]
     command_names = {line.split()[0] for line in commands_section.splitlines() if line.strip()}
-    assert command_names == {"start", "config", "test-slack", "screen"}
+    assert command_names == {"start", "config", "test-slack", "screen", "doctor"}
 
 
 def test_config_masks_secrets(monkeypatch):
@@ -270,3 +270,60 @@ def test_start_closes_the_market_data_provider_on_exit(start_environment, monkey
 
     assert result.exit_code == 0, result.output
     assert provider.closed == 1
+
+
+# --- config, doctor, logging -----------------------------------------------------------------------------------------
+
+
+def test_config_shows_every_section(start_environment):
+    result = CliRunner().invoke(market_watcher_cli.cli, ["config"])
+
+    assert result.exit_code == 0, result.output
+    for title in ("[Polling]", "[Market hours]", "[Email]", "[Slack]", "[Trading]"):
+        assert title in result.output
+    assert "market data provider: yahoo" in result.output
+    assert "polling interval: 60 s" in result.output
+    assert "long straddle threshold: 2.00%" in result.output
+    assert "polling: NYSE regular sessions only" in result.output
+    assert "email: disabled" in result.output and "slack: disabled" in result.output
+    assert "order placement: disabled" in result.output
+
+
+def test_config_reports_a_broken_setting_instead_of_crashing(start_environment, monkeypatch):
+    monkeypatch.setitem(context.config, "LONG_THRESHOLD", "two percent")
+
+    result = CliRunner().invoke(market_watcher_cli.cli, ["config"])
+
+    assert result.exit_code == 0, result.output
+    assert "error: could not convert" in result.output
+    assert "[Trading]" in result.output  # the other sections still print
+
+
+def test_doctor_command_prints_the_checks_and_sets_the_exit_code(monkeypatch):
+    from market_watcher import doctor as doctor_module
+
+    checks = [
+        doctor_module.Check("settings", doctor_module.OK, "fine"),
+        doctor_module.Check("market data", doctor_module.WARN, "no values"),
+    ]
+    monkeypatch.setattr(market_watcher_cli.doctor_module, "run_checks", lambda stocks, send_test_messages=False: checks)
+
+    result = CliRunner().invoke(market_watcher_cli.cli, ["doctor"])
+    assert result.exit_code == 0, result.output
+    assert "[ OK ] settings: fine" in result.output and "[WARN] market data: no values" in result.output
+    assert "Checks passed with 1 warning(s)." in result.output
+
+    checks.append(doctor_module.Check("trading", doctor_module.FAIL, "TWS unreachable"))
+    result = CliRunner().invoke(market_watcher_cli.cli, ["doctor", "--send-test-messages"])
+    assert result.exit_code == 1
+    assert "[FAIL] trading: TWS unreachable" in result.output and "1 check(s) failed" in result.output
+
+
+def test_log_file_is_created_when_configured(monkeypatch, tmp_path):
+    log_file = tmp_path / "market_watcher.log"
+    monkeypatch.setitem(context.config, "LOG_FILE", str(log_file))
+
+    result = CliRunner().invoke(market_watcher_cli.cli, ["config"])
+
+    assert result.exit_code == 0, result.output
+    assert log_file.exists()

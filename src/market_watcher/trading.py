@@ -316,8 +316,9 @@ class IBKRStraddleTrader:
     ``notify`` makes it an engine notifier; ``manage_positions`` an engine cycle hook.
     """
 
-    def __init__(self, settings, ib_factory=None, today=None):
+    def __init__(self, settings, ib_factory=None, today=None, announcers=()):
         self.settings = settings
+        self.announcers = list(announcers)  # notifiers with announce(subject, text) for trade events
         self.positions = {}  # ticker -> OpenStraddle
         self._ib_factory = ib_factory
         self._ib = None
@@ -327,6 +328,7 @@ class IBKRStraddleTrader:
         self._halted_on = None  # the day the daily loss limit was hit
         self._realized = []  # (day, ticker, USD)
         self._book_synced = False
+        self._summarized_on = None
 
     # Notifier interface ---------------------------------------------------------------------------------------------
 
@@ -345,6 +347,38 @@ class IBKRStraddleTrader:
             self._ib.disconnect()
             logger.info("Disconnected the trading client from IBKR")
         self._ib = None
+
+    def _announce(self, subject, text):
+        """Sends a trade event to every announcer; a failing announcer is logged and never affects trading."""
+        if self.settings.dry_run:
+            subject = f"DRY RUN - {subject}"
+        for announcer in self.announcers:
+            try:
+                announcer.announce(subject, text)
+            except Exception:
+                logger.exception("Announcer %s failed", type(announcer).__name__)
+
+    def day_summary(self, today):
+        """One paragraph on the day: closed trades with their P&L and what is still open."""
+        closed = [(ticker, pnl) for day, ticker, pnl in self._realized if day == today]
+        lines = [f"Realized P&L: {self.realized_today(today):+,.0f} USD over {len(closed)} closed straddle(s)"]
+        lines += [f"  {ticker}: {pnl:+,.0f} USD" for ticker, pnl in closed]
+        for ticker, position in sorted(self.positions.items()):
+            if position.exit_order_id is not None:
+                state = f"exit pending ({position.exit_reason})"
+            elif position.filled:
+                state = f"open since {position.entry_price:.2f}"
+            else:
+                state = "entry not filled"
+            lines.append(f"  {ticker}: {position.spec.strategy}, {state}")
+        if self._halted_on == today:
+            lines.append("Daily loss limit was hit; no new positions were opened afterwards")
+        return "\n".join(lines)
+
+    def _maybe_summarize(self, today, near_close):
+        if near_close and self._summarized_on != today:
+            self._summarized_on = today
+            self._announce("End of day summary", self.day_summary(today))
 
     def realized_today(self, day):
         return sum(pnl for realized_on, _, pnl in self._realized if realized_on == day)
@@ -375,6 +409,7 @@ class IBKRStraddleTrader:
 
         if settings.dry_run:
             logger.info("DRY RUN - would place %s", spec.describe())
+            self._announce("Straddle order", f"Would place {spec.describe()}")
             position = OpenStraddle(spec, spec.call, spec.put, None, spec.limit_price, True, today)
         else:
             trade = ib.placeOrder(spec.contract, self._order(spec.action, spec.quantity, spec.limit_price, ORDER_REF))
@@ -387,6 +422,7 @@ class IBKRStraddleTrader:
                 placement,
             )
             position = OpenStraddle(spec, spec.call, spec.put, trade.order.orderId, spec.limit_price, False, today)
+            self._announce("Straddle order placed", f"{spec.describe()}\nOrder id {trade.order.orderId}: {placement}")
         self.positions[ticker] = position
         self._placed_today[ticker] = spec
         return spec
@@ -491,12 +527,12 @@ class IBKRStraddleTrader:
                 self._rebuild_book(ib, today)
             self._book_synced = True
         self._refresh_orders(ib, today)
+        near_close = now >= session.close - timedelta(minutes=settings.exit_minutes_before_close)
         if not self.positions:
+            self._maybe_summarize(today, near_close)
             return
 
-        closing_time = not settings.hold_overnight and now >= session.close - timedelta(
-            minutes=settings.exit_minutes_before_close
-        )
+        closing_time = not settings.hold_overnight and near_close
         open_positions = [p for p in self.positions.values() if p.filled and p.exit_order_id is None]
         pending_entries = [p for p in self.positions.values() if not p.filled and p.entry_order_id is not None]
         quotes = self._quotes(ib, open_positions)
@@ -519,6 +555,11 @@ class IBKRStraddleTrader:
                     self._close(ib, position, quotes[position.spec.ticker], "daily loss limit", today)
             for position in pending_entries:
                 self._cancel_entry(ib, position)
+            self._announce(
+                "Daily loss limit hit",
+                f"Realized {self.realized_today(today):+,.0f} USD, unrealized {unrealized:+,.0f} USD, "
+                f"limit {settings.max_daily_loss:,.0f} USD: closing everything; no new positions today",
+            )
             return
 
         for position in open_positions:
@@ -532,6 +573,7 @@ class IBKRStraddleTrader:
         if closing_time:
             for position in pending_entries:
                 self._cancel_entry(ib, position)
+        self._maybe_summarize(today, near_close)
 
     def _roll_day(self, today):
         if today != self._day:
@@ -563,6 +605,11 @@ class IBKRStraddleTrader:
                     pnl = unrealized_pnl(position, price)
                     self._realized.append((today, ticker, pnl))
                     del self.positions[ticker]
+                    self._announce(
+                        "Straddle closed",
+                        f"{ticker} closed at {price:.2f} ({position.exit_reason}): {pnl:+,.0f} USD; "
+                        f"realized today {self.realized_today(today):+,.0f} USD",
+                    )
                     logger.info(
                         "Closed the %s straddle at %.2f (%s): %+.0f USD", ticker, price, position.exit_reason, pnl
                     )
@@ -580,6 +627,9 @@ class IBKRStraddleTrader:
                 if status == FILLED:
                     position.filled = True
                     position.entry_price = trade.orderStatus.avgFillPrice or position.entry_price
+                    self._announce(
+                        "Straddle entry filled", f"{position.spec.describe()}\nFilled at {position.entry_price:.2f}"
+                    )
                     logger.info("Entry filled: %s at %.2f", position.spec.describe(), position.entry_price)
                 elif status in DEAD_ORDER_STATUSES:
                     logger.warning("Entry order %s for %s was cancelled; forgetting it", trade.order.orderId, ticker)
@@ -594,6 +644,7 @@ class IBKRStraddleTrader:
             self._realized.append((today, ticker, pnl))
             del self.positions[ticker]
             logger.info("DRY RUN - would close the %s straddle at %.2f (%s): %+.0f USD", ticker, limit, reason, pnl)
+            self._announce("Straddle closed", f"Would close {ticker} at {limit:.2f} ({reason}): {pnl:+,.0f} USD")
             return
         trade = ib.placeOrder(position.spec.contract, self._order(action, position.spec.quantity, limit, EXIT_REF))
         position.exit_order_id = trade.order.orderId
@@ -608,6 +659,10 @@ class IBKRStraddleTrader:
             reason,
             trade.order.orderId,
             "transmitted" if self.settings.transmit else "staged in TWS (transmit it manually)",
+        )
+        self._announce(
+            "Closing straddle",
+            f"{ticker}: {action} {position.spec.quantity} at {limit:.2f} ({reason}) - order id {trade.order.orderId}",
         )
 
     def _cancel_entry(self, ib, position):

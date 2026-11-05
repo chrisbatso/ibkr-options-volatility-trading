@@ -68,6 +68,11 @@ def get_email_config():
     }
 
 
+def get_update_timeout():
+    """Polling interval in seconds."""
+    return int(_required_config("UPDATE_TIMEOUT"))
+
+
 def get_pnl_threshold_config():
     """Returns strategy alert configuration."""
     return {
@@ -81,6 +86,8 @@ def get_slack_config():
     return {
         "long url": _required_config("SLACK_LONG_WEBHOOK"),
         "short url": _required_config("SLACK_SHORT_WEBHOOK"),
+        # Optional: trade events and the daily summary go here instead of the long straddle channel.
+        "trading url": context.config.get("SLACK_TRADING_WEBHOOK") or None,
     }
 
 
@@ -156,7 +163,7 @@ class MarketWatcherEngine:
         source being unreachable) is logged and retried on the next cycle instead
         of terminating the bot.
         """
-        update_timeout = int(_required_config("UPDATE_TIMEOUT"))
+        update_timeout = get_update_timeout()
 
         while not self._stop_event.is_set():
             now = self._clock()

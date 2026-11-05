@@ -150,3 +150,30 @@ def test_short_straddle_message_lists_smallest_moves_first_and_omits_direction_f
     message = SlackNotifier(SLACK_CONFIG)._short_straddle_message({"TTMI": 0.004, "TPCO": 0.0, "KO": -0.002})
 
     assert message == "Short straddle opportunities:\nTPCO: 0.0%\nKO: 0.2% (DOWN)\nTTMI: 0.4% (UP)"
+
+
+# --- announce --------------------------------------------------------------------------------------------------------
+
+
+def test_email_announce_sends_a_subject_and_body(smtp):
+    EmailNotifier(EMAIL_CONFIG).announce("Straddle order placed", "BUY 1 x AAPL 20261120 100 straddle")
+
+    [server] = smtp.instances
+    [(sender, recipients, message)] = server.sent
+    assert recipients == ["alice@example.com", "bob@example.com"]
+    assert "Subject: MarketWatcher: Straddle order placed" in message
+    assert "BUY 1 x AAPL 20261120 100 straddle" in message
+
+
+def test_slack_announce_uses_the_trading_channel_when_configured(webhook):
+    notifier = SlackNotifier({**SLACK_CONFIG, "trading url": "https://hooks.example/trading"})
+
+    notifier.announce("Closing straddle", "AAPL: SELL 1 at 9.02")
+
+    assert webhook.calls == [("https://hooks.example/trading", "*Closing straddle*\nAAPL: SELL 1 at 9.02")]
+
+
+def test_slack_announce_falls_back_to_the_long_straddle_channel(webhook):
+    SlackNotifier({**SLACK_CONFIG, "trading url": None}).announce("End of day summary", "Realized P&L: +310 USD")
+
+    assert webhook.calls[0][0] == "https://hooks.example/long"

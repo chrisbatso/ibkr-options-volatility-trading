@@ -27,6 +27,10 @@ class Notifier:
     def notify(self, investment_data):
         raise NotImplementedError
 
+    def announce(self, subject, text):
+        """Sends a free-form message, e.g. a trade event or the daily summary."""
+        raise NotImplementedError
+
     def _long_straddle_message(self, data):
         # Biggest moves first.
         sorted_data = sorted(data.items(), key=lambda item: abs(item[1]), reverse=True)
@@ -80,6 +84,14 @@ class EmailNotifier(Notifier):
 
         self.send(message.as_string())
 
+    def announce(self, subject, text):
+        message = MIMEMultipart()
+        message["From"] = self._sender
+        message["To"] = ", ".join(self._recipients)
+        message["Subject"] = f"MarketWatcher: {subject}"
+        message.attach(MIMEText(text, "plain"))
+        self.send(message.as_string())
+
     def send(self, message):
         ssl_context = ssl.create_default_context()
         with smtplib.SMTP_SSL(self._hostname, self._port, context=ssl_context) as server:
@@ -93,6 +105,7 @@ class SlackNotifier(Notifier):
     def __init__(self, config):
         self._long_url = config["long url"]
         self._short_url = config["short url"]
+        self._trading_url = config.get("trading url") or self._long_url
 
     def notify(self, investment_data):
         long_data = investment_data.get(STRATEGIES.LONG_STRADDLE.value) or {}
@@ -102,6 +115,9 @@ class SlackNotifier(Notifier):
             self.send_message(self._long_url, self._long_straddle_message(long_data))
         if short_data:
             self.send_message(self._short_url, self._short_straddle_message(short_data))
+
+    def announce(self, subject, text):
+        self.send_message(self._trading_url, f"*{subject}*\n{text}")
 
     def send_message(self, url, text):
         """Posts a message to a Slack channel through its incoming webhook."""

@@ -1,14 +1,23 @@
 import logging
 import signal
 import sys
+from logging.handlers import RotatingFileHandler
 
 import click
 from click.utils import echo
 
+from market_watcher import doctor as doctor_module
 from market_watcher import screen as screen_module
-from market_watcher.common import MarketWatcherEngine, get_email_config, get_slack_config, get_target_stocks
-from market_watcher.config import config_flag, context
-from market_watcher.market_data import create_provider
+from market_watcher.common import (
+    MarketWatcherEngine,
+    get_email_config,
+    get_pnl_threshold_config,
+    get_slack_config,
+    get_target_stocks,
+    get_update_timeout,
+)
+from market_watcher.config import config_flag, config_int, context
+from market_watcher.market_data import DEFAULT_PROVIDER, create_provider
 from market_watcher.market_hours import AlwaysOpen, USMarketHours, parse_closures
 from market_watcher.notifier import EmailNotifier, SlackNotifier
 from market_watcher.trading import IBKRStraddleTrader, TradingSettings
@@ -23,10 +32,20 @@ SLACK_WEBHOOK_PREFIX = "https://hooks.slack.com/services/"
 STOP_SIGNALS = (signal.SIGINT, signal.SIGTERM)
 
 
+def configure_logging(log_file=None):
+    """Logs to stderr and, when LOG_FILE is set, to a rotating file (10 MB x 5) for unattended runs."""
+    handlers = [logging.StreamHandler()]
+    if log_file:
+        handlers.append(RotatingFileHandler(log_file, maxBytes=10 * 1024 * 1024, backupCount=5))
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s", handlers=handlers, force=True
+    )
+
+
 @click.group()
 def cli():
     """MarketWatcher cli commands."""
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    configure_logging(context.config.get("LOG_FILE"))
     echo(
         r"""
          ______              _              _  _  _                 _
@@ -65,31 +84,92 @@ def test_slack():
 
 def _display_value(key, value):
     """Masks secrets so the output of `config` can be shared safely."""
+    if value is None:
+        return "(not set)"
     if "password" in key:
         return "********"
-    if "url" in key and value.startswith(SLACK_WEBHOOK_PREFIX):
+    if "url" in key and isinstance(value, str) and value.startswith(SLACK_WEBHOOK_PREFIX):
         return SLACK_WEBHOOK_PREFIX + "..."
     return value
 
 
+def _section(title, loader):
+    """Rows of one configuration section, or a single error row when a setting is missing or malformed."""
+    try:
+        return title, list(loader())
+    except Exception as e:
+        return title, [("error", str(e))]
+
+
+def effective_configuration():
+    """The configuration `start` would run with, as (section, [(key, value)]) with secrets masked."""
+
+    def polling():
+        thresholds = get_pnl_threshold_config()
+        yield "market data provider", (context.config.get("MARKET_DATA_PROVIDER") or DEFAULT_PROVIDER).strip().lower()
+        yield "polling interval", f"{get_update_timeout()} s"
+        yield "long straddle threshold", f"{thresholds['LONG_THRESHOLD']:.2%}"
+        yield "short straddle threshold", f"{thresholds['SHORT_THRESHOLD']:.2%}"
+        yield "log file", context.config.get("LOG_FILE") or "(stderr only)"
+
+    def market_hours():
+        if config_flag("MARKET_HOURS_ENABLED", default=True):
+            closures = sorted(parse_closures(context.config.get("MARKET_HOLIDAYS")))
+            yield "polling", "NYSE regular sessions only"
+            yield "extra closures", ", ".join(str(day) for day in closures) or "none"
+            yield (
+                "short straddle warm-up",
+                f"{config_int('SHORT_STRADDLE_WARMUP_MINUTES', default=30)} min after the open",
+            )
+        else:
+            yield "polling", "around the clock (MARKET_HOURS_ENABLED=false)"
+
+    def notifier(name, flag, loader):
+        def rows():
+            if not config_flag(flag, default=True):
+                yield name, "disabled"
+                return
+            for key, value in loader().items():
+                yield f"{name} {key}", _display_value(key, value)
+
+        return rows
+
+    def trading():
+        settings = TradingSettings.from_config()
+        yield "order placement", settings.describe() if settings.enabled else "disabled (TRADING_ENABLED=false)"
+
+    return [
+        _section("Polling", polling),
+        _section("Market hours", market_hours),
+        _section("Email", notifier("email", "EMAIL_NOTIFIER_ENABLED", get_email_config)),
+        _section("Slack", notifier("slack", "SLACK_NOTIFIER_ENABLED", get_slack_config)),
+        _section("Trading", trading),
+    ]
+
+
 @cli.command()
-@click.option(
-    "--notifier",
-    default="all",
-    help="Available options: email, slack, all",
-)
-def config(notifier):
-    """Lists configuration for slack and email notifiers (secrets are masked)."""
+def config():
+    """Shows the effective configuration `start` would run with (secrets are masked)."""
+    for title, rows in effective_configuration():
+        echo(f"[{title}]")
+        for key, value in rows:
+            echo(f"  {key}: {value}")
 
-    if notifier in ("all", "slack"):
-        config = get_slack_config()
-        for key, value in config.items():
-            echo(f"{key}: {_display_value(key, value)}")
 
-    if notifier in ("all", "email"):
-        config = get_email_config()
-        for key, value in config.items():
-            echo(f"{key}: {_display_value(key, value)}")
+@cli.command()
+@click.option("--stocks", default=screen_module.DEFAULT_OUTPUT, show_default=True, help="Target stocks YAML to check.")
+@click.option("--send-test-messages", is_flag=True, help="Also post a test message to Slack and send a test email.")
+def doctor(stocks, send_test_messages):
+    """Checks settings, target stocks, market hours, the data source, notifiers and TWS before you run `start`."""
+    checks = doctor_module.run_checks(stocks, send_test_messages=send_test_messages)
+    labels = {doctor_module.OK: " OK ", doctor_module.WARN: "WARN", doctor_module.FAIL: "FAIL"}
+    for check in checks:
+        echo(f"[{labels[check.status]}] {check.name}: {check.detail}")
+    failed = [check for check in checks if check.status == doctor_module.FAIL]
+    if failed:
+        raise click.ClickException(f"{len(failed)} check(s) failed")
+    warnings = [check for check in checks if check.status == doctor_module.WARN]
+    echo("All checks passed." if not warnings else f"Checks passed with {len(warnings)} warning(s).")
 
 
 @cli.command("screen")
@@ -204,7 +284,7 @@ def start(stocks):
         cycle_hooks = []
         trading = TradingSettings.from_config()
         if trading.enabled:
-            trader = IBKRStraddleTrader(trading)
+            trader = IBKRStraddleTrader(trading, announcers=list(notifiers))
             notifiers.append(trader)
             closers.append(trader)
             cycle_hooks.append(trader.manage_positions)

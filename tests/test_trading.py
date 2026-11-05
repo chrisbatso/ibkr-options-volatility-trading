@@ -788,3 +788,99 @@ def test_settings_reject_zero_contracts_orders_or_positions(monkeypatch, key, va
 
     with pytest.raises(ValueError, match=key):
         TradingSettings.from_config()
+
+
+# --- Announcements and the daily summary -----------------------------------------------------------------------------
+
+
+class RecordingAnnouncer:
+    def __init__(self):
+        self.messages = []
+
+    def announce(self, subject, text):
+        self.messages.append((subject, text))
+
+
+class FailingAnnouncer:
+    def announce(self, subject, text):
+        raise RuntimeError("webhook down")
+
+
+def announcing_trader(announcer, **overrides):
+    settings = TradingSettings(**{"enabled": True, **overrides})
+    return IBKRStraddleTrader(
+        settings, ib_factory=FakeIB, today=lambda: TODAY, announcers=[FailingAnnouncer(), announcer]
+    )
+
+
+def test_trade_events_are_announced_in_order_and_a_failing_announcer_is_isolated(fake_ib):
+    announcer = RecordingAnnouncer()
+    trader = announcing_trader(announcer)
+
+    trader.place_straddle("AAPL", LONG)
+    [ib] = fake_ib.instances
+    ib.trade_objects[0].fill(6.0)
+    trader.manage_positions(NOW, SESSION)  # entry filled
+    quote_atm(5.0, 5.2, 4.0, 4.2)
+    trader.manage_positions(NOW, SESSION)  # take-profit exit placed
+    ib.trade_objects[1].fill(9.1)
+    trader.manage_positions(NOW, SESSION)  # exit filled
+
+    subjects = [subject for subject, _ in announcer.messages]
+    assert subjects == ["Straddle order placed", "Straddle entry filled", "Closing straddle", "Straddle closed"]
+    assert "Order id 1: staged in TWS" in announcer.messages[0][1]
+    assert "Filled at 6.00" in announcer.messages[1][1]
+    assert "(take profit" in announcer.messages[2][1]
+    assert "+310 USD" in announcer.messages[3][1]
+
+
+def test_dry_run_announcements_are_labelled(fake_ib):
+    announcer = RecordingAnnouncer()
+    trader = announcing_trader(announcer, dry_run=True)
+
+    trader.place_straddle("AAPL", LONG)
+    quote_atm(5.0, 5.2, 4.0, 4.2)
+    trader.manage_positions(NOW, SESSION)
+
+    assert [subject for subject, _ in announcer.messages] == ["DRY RUN - Straddle order", "DRY RUN - Straddle closed"]
+    assert announcer.messages[0][1].startswith("Would place BUY 1 x AAPL")
+
+
+def test_daily_loss_limit_is_announced(fake_ib):
+    announcer = RecordingAnnouncer()
+    trader = announcing_trader(announcer, max_daily_loss=100)
+    trader.place_straddle("AAPL", LONG)
+    fake_ib.instances[0].trade_objects[0].fill(6.0)
+    quote_atm(2.4, 2.5, 2.4, 2.5)
+
+    trader.manage_positions(NOW, SESSION)
+
+    subjects = [subject for subject, _ in announcer.messages]
+    assert subjects == ["Straddle order placed", "Straddle entry filled", "Closing straddle", "Daily loss limit hit"]
+    assert "limit 100 USD" in announcer.messages[-1][1]
+
+
+def test_end_of_day_summary_is_announced_once_near_the_close(fake_ib):
+    announcer = RecordingAnnouncer()
+    trader = announcing_trader(announcer)
+    trader.place_straddle("AAPL", LONG)
+    [ib] = fake_ib.instances
+    ib.trade_objects[0].fill(6.0)
+    quote_atm(5.0, 5.2, 4.0, 4.2)
+    trader.manage_positions(NOW, SESSION)
+    ib.trade_objects[1].fill(9.1)
+    trader.manage_positions(NOW, SESSION)
+    trader.place_straddle("MSFT", LONG)  # a second straddle whose entry never fills
+
+    summary_before_close = trader.day_summary(TODAY)
+    assert "Realized P&L: +310 USD over 1 closed straddle(s)" in summary_before_close
+    assert "  AAPL: +310 USD" in summary_before_close
+    assert "  MSFT: long straddle, entry not filled" in summary_before_close
+
+    trader.manage_positions(NEAR_CLOSE, SESSION)
+    trader.manage_positions(NEAR_CLOSE, SESSION)  # not repeated
+
+    summaries = [text for subject, text in announcer.messages if subject == "End of day summary"]
+    assert len(summaries) == 1
+    assert summaries[0].startswith("Realized P&L: +310 USD over 1 closed straddle(s)")
+    assert ib.cancelled == [3]  # the unfilled MSFT entry was cancelled at the close
