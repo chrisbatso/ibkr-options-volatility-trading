@@ -127,9 +127,9 @@ def test_start_runs_the_engine_and_exits_cleanly(start_environment):
     [engine] = engines_run
     assert engine.target_stocks == {"AAPL": {"strategy": "short straddle"}}
     assert engine.notifiers == []
-    assert engine.data_provider.name == "yahoo"
+    assert engine.data_provider.name == "yfinance"  # "yahoo" is an alias for the default
     assert isinstance(engine.market_hours, USMarketHours)
-    assert "Using market data provider: yahoo" in result.output
+    assert "Using market data provider: yfinance" in result.output
     assert "NYSE regular trading hours" in result.output
     assert "both notifiers are disabled" in result.output
     assert "MarketWatcher started." in result.output

@@ -39,9 +39,12 @@ class MarketDataProvider(ABC):
 
 
 class YahooFinanceProvider(MarketDataProvider):
-    """Daily P&L from Yahoo Finance through the ``yahoofinancials`` package."""
+    """Daily P&L from Yahoo Finance through the ``yahoofinancials`` package: one HTTP request per ticker.
 
-    name = "yahoo"
+    Kept as a fallback; :class:`YFinanceProvider` fetches the whole universe in one batched call.
+    """
+
+    name = "yahoofinancials"
 
     def __init__(self, client_factory=YahooFinancials):
         self._client_factory = client_factory
@@ -59,6 +62,61 @@ def _as_fraction(value):
     if isinstance(value, bool) or not isinstance(value, int | float):
         return None
     return float(value)
+
+
+class YFinanceProvider(MarketDataProvider):
+    """Daily P&L from Yahoo Finance through ``yfinance``: the whole universe in one batched download per cycle.
+
+    The change is the last close over the previous close of the split/dividend-adjusted
+    daily bars. During the session the last bar is today's, still forming, so this is the
+    live move; before the open it is the previous session's move, like Yahoo's own quote.
+    """
+
+    name = "yfinance"
+
+    def __init__(self, download=None):
+        self._download = download
+
+    def get_daily_pnls(self, tickers):
+        tickers = list(tickers)
+        if not tickers:
+            return {}
+        if self._download is None:
+            try:
+                import yfinance
+            except ImportError:
+                raise RuntimeError(
+                    "The yfinance market data provider needs the yfinance package: pip install yfinance"
+                ) from None
+            self._download = yfinance.download
+        data = self._download(
+            tickers, period="5d", interval="1d", group_by="ticker", auto_adjust=True, threads=True, progress=False
+        )
+        result = {ticker: _daily_change(_closes(data, ticker)) for ticker in tickers}
+        if all(value is None for value in result.values()):
+            # yfinance swallows network errors and returns an empty frame; make that a loud, retried failure.
+            raise RuntimeError(
+                f"yfinance returned no data for any of {len(tickers)} ticker(s): network problem, Yahoo rate limit, "
+                "or every ticker unknown"
+            )
+        return result
+
+
+def _closes(data, ticker):
+    """Valid closes of ``ticker`` (oldest first) from a yfinance download, whether grouped by ticker or not."""
+    grouped = hasattr(data.columns, "levels")  # a MultiIndex: (ticker, field)
+    try:
+        frame = data[ticker] if grouped else data
+        series = frame["Close"]
+    except KeyError:
+        return []
+    return [float(value) for value in series.dropna()]
+
+
+def _daily_change(closes):
+    if len(closes) < 2 or closes[-2] <= 0:
+        return None
+    return (closes[-1] - closes[-2]) / closes[-2]
 
 
 class IBKRProvider(MarketDataProvider):
@@ -172,10 +230,12 @@ def _percent_change(price, previous_close):
 
 
 PROVIDERS: dict[str, type[MarketDataProvider]] = {
+    YFinanceProvider.name: YFinanceProvider,
+    "yahoo": YFinanceProvider,  # alias for the default, kept for older .env files
     YahooFinanceProvider.name: YahooFinanceProvider,
     IBKRProvider.name: IBKRProvider,
 }
-DEFAULT_PROVIDER = YahooFinanceProvider.name
+DEFAULT_PROVIDER = YFinanceProvider.name
 
 
 def create_provider(name=None):

@@ -9,8 +9,9 @@ A ground-up overhaul: the 2021 course project brought back to a buildable, teste
 state, then extended with the Interactive Brokers integration it always promised.
 
 ### Added
-- `MarketDataProvider` abstraction with a Yahoo Finance provider and an **Interactive
-  Brokers provider** (`MARKET_DATA_PROVIDER=ibkr`, built on `ib_async`, optional
+- `MarketDataProvider` abstraction with two Yahoo Finance providers (`yfinance`, the
+  default, fetches the whole universe in one batched download; `yahoofinancials` is kept
+  as a fallback) and an **Interactive Brokers provider** (`MARKET_DATA_PROVIDER=ibkr`, built on `ib_async`, optional
   `ibkr` extra).
 - **Market-hours gating**: polling only during NYSE sessions (holidays and early
   closes computed from the published rules), with a configurable warm-up before

@@ -6,7 +6,13 @@ import pytest
 
 from market_watcher import market_data
 from market_watcher.config import context
-from market_watcher.market_data import IBKRProvider, MarketDataProvider, YahooFinanceProvider, create_provider
+from market_watcher.market_data import (
+    IBKRProvider,
+    MarketDataProvider,
+    YahooFinanceProvider,
+    YFinanceProvider,
+    create_provider,
+)
 
 # --- Yahoo Finance ---------------------------------------------------------------------------------------------------
 
@@ -227,17 +233,23 @@ class FakeContext:
         self.config = config
 
 
-def test_create_provider_defaults_to_yahoo(monkeypatch):
+def test_create_provider_defaults_to_yfinance(monkeypatch):
     monkeypatch.setattr(market_data, "context", FakeContext())
 
-    assert isinstance(create_provider(), YahooFinanceProvider)
+    assert isinstance(create_provider(), YFinanceProvider)
 
 
-@pytest.mark.parametrize("value", ["yahoo", "Yahoo", " YAHOO "])
+@pytest.mark.parametrize("value", ["yfinance", "YFinance", " yahoo "])
 def test_create_provider_reads_the_setting_case_insensitively(monkeypatch, value):
     monkeypatch.setattr(market_data, "context", FakeContext(MARKET_DATA_PROVIDER=value))
 
-    assert create_provider().name == "yahoo"
+    assert create_provider().name == "yfinance"
+
+
+def test_yahoofinancials_remains_available_by_name(monkeypatch):
+    monkeypatch.setattr(market_data, "context", FakeContext(MARKET_DATA_PROVIDER="yahoofinancials"))
+
+    assert isinstance(create_provider(), YahooFinanceProvider)
 
 
 def test_create_provider_knows_ibkr(monkeypatch):
@@ -249,7 +261,7 @@ def test_create_provider_knows_ibkr(monkeypatch):
 def test_create_provider_rejects_unknown_names(monkeypatch):
     monkeypatch.setattr(market_data, "context", FakeContext(MARKET_DATA_PROVIDER="bloomberg"))
 
-    with pytest.raises(ValueError, match="'bloomberg'.*available: ibkr, yahoo"):
+    with pytest.raises(ValueError, match="'bloomberg'.*available: ibkr, yahoo, yahoofinancials, yfinance"):
         create_provider()
 
 
@@ -267,3 +279,97 @@ def test_new_providers_can_be_registered(monkeypatch):
     assert isinstance(provider, ConstantProvider)
     assert provider.get_daily_pnls(["AAPL"]) == {"AAPL": 0.0}
     provider.close()  # the default close() is a no-op
+
+
+# --- yfinance --------------------------------------------------------------------------------------------------------
+
+
+def yfinance_frame(closes_by_ticker):
+    """A yfinance-style download grouped by ticker; ``None`` closes become NaN (holidays, missing data)."""
+    pd = pytest.importorskip("pandas")
+    tickers = list(closes_by_ticker)
+    days = max(len(closes) for closes in closes_by_ticker.values())
+    index = pd.date_range("2026-10-29", periods=days, freq="B")
+    columns = pd.MultiIndex.from_product([tickers, ["Close", "Volume"]])
+    rows = []
+    for day in range(days):
+        row = []
+        for ticker in tickers:
+            closes = closes_by_ticker[ticker]
+            value = closes[day] if day < len(closes) else None
+            row += [math.nan if value is None else value, 1_000.0]
+        rows.append(row)
+    return pd.DataFrame(rows, index=index, columns=columns)
+
+
+class FakeDownload:
+    def __init__(self, frame):
+        self.frame = frame
+        self.calls = []
+
+    def __call__(self, tickers, **kwargs):
+        self.calls.append((tickers, kwargs))
+        return self.frame
+
+
+def test_yfinance_provider_downloads_the_universe_once_and_uses_the_last_two_closes():
+    download = FakeDownload(
+        yfinance_frame({"AAPL": [100.0, 101.0, 102.0], "KO": [50.0, 50.0, 49.0], "DEAD": [None, None, None]})
+    )
+
+    result = YFinanceProvider(download=download).get_daily_pnls(["AAPL", "KO", "DEAD", "MISSING"])
+
+    [(tickers, kwargs)] = download.calls
+    assert tickers == ["AAPL", "KO", "DEAD", "MISSING"]
+    assert (kwargs["period"], kwargs["interval"], kwargs["group_by"], kwargs["auto_adjust"]) == (
+        "5d",
+        "1d",
+        "ticker",
+        True,
+    )
+    assert result["AAPL"] == pytest.approx(1 / 101)  # 101 -> 102
+    assert result["KO"] == pytest.approx(-0.02)
+    assert result["DEAD"] is None and result["MISSING"] is None
+
+
+def test_yfinance_provider_skips_days_without_a_close():
+    download = FakeDownload(yfinance_frame({"AAPL": [100.0, 110.0, None]}))  # today's bar not yet available
+
+    assert YFinanceProvider(download=download).get_daily_pnls(["AAPL"])["AAPL"] == pytest.approx(0.10)
+
+
+def test_yfinance_provider_needs_two_closes():
+    download = FakeDownload(yfinance_frame({"NEW": [100.0], "AAPL": [100.0, 101.0]}))
+
+    assert YFinanceProvider(download=download).get_daily_pnls(["NEW", "AAPL"])["NEW"] is None
+
+
+def test_yfinance_provider_raises_when_nothing_comes_back():
+    """yfinance swallows network errors and returns an empty frame; the engine must see a failure, not silence."""
+    download = FakeDownload(yfinance_frame({"AAPL": [None, None], "KO": [None, None]}))
+
+    with pytest.raises(RuntimeError, match="no data for any of 2 ticker"):
+        YFinanceProvider(download=download).get_daily_pnls(["AAPL", "KO"])
+
+
+def test_yfinance_provider_handles_a_single_ticker_frame_without_grouping():
+    pd = pytest.importorskip("pandas")
+    frame = pd.DataFrame(
+        {"Close": [100.0, 103.0], "Volume": [1.0, 1.0]}, index=pd.date_range("2026-11-03", periods=2, freq="B")
+    )
+
+    assert YFinanceProvider(download=FakeDownload(frame)).get_daily_pnls(["AAPL"])["AAPL"] == pytest.approx(0.03)
+
+
+def test_yfinance_provider_does_not_download_without_tickers():
+    download = FakeDownload(None)
+
+    assert YFinanceProvider(download=download).get_daily_pnls([]) == {}
+    assert download.calls == []
+
+
+def test_yfinance_provider_explains_the_missing_dependency(monkeypatch):
+    monkeypatch.setitem(sys.modules, "yfinance", None)
+
+    with pytest.raises(RuntimeError, match="pip install yfinance"):
+        YFinanceProvider().get_daily_pnls(["AAPL"])

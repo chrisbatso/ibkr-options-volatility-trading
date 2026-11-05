@@ -43,7 +43,10 @@ def _error(exception):
 
 def check_dependencies():
     parts = []
-    for package, needed_for in (("ib_async", "the ibkr provider and trading"), ("yfinance", "the screen command")):
+    for package, needed_for in (
+        ("ib_async", "the ibkr provider and trading"),
+        ("yfinance", "the default market data provider"),
+    ):
         try:
             parts.append(f"{package} {importlib.metadata.version(package)}")
         except importlib.metadata.PackageNotFoundError:
@@ -112,6 +115,8 @@ def check_market_data(tickers):
         hint = ""
         if provider is not None and provider.name == "ibkr":
             hint = " - is TWS / IB Gateway running with the API enabled on IBKR_HOST:IBKR_PORT?"
+        elif provider is not None:
+            hint = " - is the machine online, and is Yahoo Finance reachable (not rate-limited)?"
         return Check("market data", FAIL, f"{_error(e)}{hint}")
     values = {ticker: value for ticker, value in result.items() if value is not None}
     if not values:

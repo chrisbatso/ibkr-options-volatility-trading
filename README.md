@@ -145,10 +145,7 @@ pytest
 
 `market_watcher_cli screen` reproduces the research step. It downloads the iShares Russell 3000 ETF (IWV) holdings as the universe, fetches three months of daily split-adjusted prices from Yahoo Finance, computes the volatility (standard deviation of daily log returns) over the last 5, 10 and 21 trading days, combines them as `0.5 * vol_5d + 0.3 * vol_10d + 0.2 * vol_21d`, and writes the 50 most volatile stocks as long straddle candidates and the 50 least volatile as short straddle candidates to `src/market_watcher/research/target_stocks.yaml`. Stocks below $5 or with less than $5M average daily dollar volume are skipped (penny stocks have noisy volatility and rarely have tradable options); tune that with `--min-price` / `--min-dollar-volume`, and the list size with `--top`.
 
-It needs the `research` extra:
-
 ```bash
-pip install -e ".[research]"
 market_watcher_cli screen --report screen_report.csv
 ```
 
@@ -160,7 +157,8 @@ The engine reads daily P&L through a small `MarketDataProvider` interface (`src/
 
 | Name | Source |
 |---|---|
-| `yahoo` (default) | Yahoo Finance, through the [`yahoofinancials`](https://github.com/JECSand/yahoofinancials) package |
+| `yfinance` (default) | Yahoo Finance through [`yfinance`](https://github.com/ranaroussi/yfinance): the whole universe in one batched download per cycle |
+| `yahoofinancials` | Yahoo Finance through [`yahoofinancials`](https://github.com/JECSand/yahoofinancials): one request per ticker (kept as a fallback) |
 | `ibkr` | Interactive Brokers TWS / IB Gateway, through the [`ib_async`](https://github.com/ib-api-reloaded/ib_async) package (`pip install -e ".[ibkr]"`; see *IBKR requirements* below) |
 
 To add a source (for example IBKR TWS), subclass `MarketDataProvider`, give it a `name`, implement `get_daily_pnls`, and register the class in `PROVIDERS`.
