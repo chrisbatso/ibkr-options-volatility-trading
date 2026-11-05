@@ -188,10 +188,23 @@ def doctor(stocks, send_test_messages):
     show_default=True,
     help="Skip stocks whose 21-day average dollar volume is below this (USD).",
 )
+@click.option(
+    "--min-volatility",
+    default=screen_module.DEFAULT_MIN_VOLATILITY,
+    show_default=True,
+    help="Skip stocks whose weighted volatility is below this fraction (0.005 = 0.5%); a stock that flat is usually "
+    "pinned to a takeover price. 0 disables the filter.",
+)
+@click.option(
+    "--require-options/--no-require-options",
+    default=True,
+    show_default=True,
+    help="Select only stocks with listed options (one Yahoo Finance request per candidate).",
+)
 @click.option("--output", default=screen_module.DEFAULT_OUTPUT, show_default=True, help="Target stocks YAML to write.")
 @click.option("--report", default=None, help="Also write a CSV with the volatility of every screened stock.")
-def screen_command(universe, top, min_price, min_dollar_volume, output, report):
-    """Regenerates the target stocks file from a historical-volatility screen (needs the `research` extra)."""
+def screen_command(universe, top, min_price, min_dollar_volume, min_volatility, require_options, output, report):
+    """Regenerates the target stocks file from a historical-volatility screen of a stock universe."""
     echo(f"Screening universe {universe!r} for the {top} most and {top} least volatile stocks...")
 
     try:
@@ -200,6 +213,8 @@ def screen_command(universe, top, min_price, min_dollar_volume, output, report):
             top=top,
             min_price=min_price,
             min_dollar_volume=min_dollar_volume,
+            min_volatility=min_volatility,
+            require_options=require_options,
             output=output,
             report=report,
         )

@@ -18,7 +18,9 @@ state, then extended with the Interactive Brokers integration it always promised
   short-straddle alerts and `MARKET_HOLIDAYS` for unscheduled closures.
 - `market_watcher_cli screen`: regenerates `target_stocks.yaml` from the
   weighted-volatility screen described in the README, over the Russell 3000 (iShares IWV
-  holdings), every US-listed stock (Nasdaq Trader symbol directory) or a local ticker list.
+  holdings), every US-listed stock (Nasdaq Trader symbol directory) or a local ticker list,
+  with liquidity filters, a volatility floor against takeover-pinned stocks and a
+  listed-options check.
 - **Experimental, off-by-default order placement** on IBKR: at-the-money straddle
   combo orders staged in TWS for manual transmit, paper accounts only, long
   straddles only, with premium / notional / per-day caps and a dry-run mode.

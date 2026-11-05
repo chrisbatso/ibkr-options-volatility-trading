@@ -190,24 +190,45 @@ def test_screen_writes_the_target_stocks_and_summarises(monkeypatch, tmp_path):
     def closes(amplitude):
         return [100.0 * (1 + amplitude * (1 if day % 2 else -1)) for day in range(30)]
 
-    monkeypatch.setattr(screen_module, "load_universe", lambda source: ["CALM", "WILD"])
+    monkeypatch.setattr(screen_module, "load_universe", lambda source: ["CALM", "WILD", "NOOPT"])
     monkeypatch.setattr(
         screen_module,
         "fetch_history",
         lambda tickers: {
             "CALM": History(closes(0.005), [1e7] * 30),
             "WILD": History(closes(0.05), [1e7] * 30),
+            "NOOPT": History(closes(0.08), [1e7] * 30),
         },
     )
+    monkeypatch.setattr(screen_module, "yfinance_has_options", lambda ticker: ticker != "NOOPT")
     output = tmp_path / "stocks.yaml"
 
     result = CliRunner().invoke(market_watcher_cli.cli, ["screen", "--top", "1", "--output", str(output)])
 
     assert result.exit_code == 0, result.output
+    assert "skipped 1: no listed options" in result.output
     assert "Long straddle (most volatile): WILD" in result.output
     assert "Short straddle (least volatile): CALM" in result.output
     assert f"Wrote {output}" in result.output
     assert output.exists()
+
+
+def test_screen_can_skip_the_options_check(monkeypatch, tmp_path):
+    from market_watcher import screen as screen_module
+    from market_watcher.screen import History
+
+    trending = History([100.0 + i for i in range(30)], [1e7] * 30)
+    monkeypatch.setattr(screen_module, "load_universe", lambda source: ["ONLY"])
+    monkeypatch.setattr(screen_module, "fetch_history", lambda tickers: {"ONLY": trending})
+    monkeypatch.setattr(screen_module, "yfinance_has_options", lambda ticker: pytest.fail("must not be asked"))
+
+    result = CliRunner().invoke(
+        market_watcher_cli.cli,
+        ["screen", "--top", "1", "--no-require-options", "--min-volatility", "0", "--output", str(tmp_path / "s.yaml")],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Long straddle (most volatile): ONLY" in result.output
 
 
 def test_screen_fails_clearly(monkeypatch, tmp_path):

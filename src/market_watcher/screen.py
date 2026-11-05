@@ -37,6 +37,10 @@ WINDOWS = (5, 10, 21)  # trading days: one week, two weeks, one month
 WEIGHTS = (0.5, 0.3, 0.2)
 REQUIRED_CLOSES = max(WINDOWS) + 1
 DOLLAR_VOLUME_DAYS = max(WINDOWS)
+# A stock whose daily moves average well under half a percent is almost always pinned to a pending cash takeover:
+# no premium to sell and a gap if the deal breaks. Normal low-volatility stocks (utilities, insurers) sit near 1%.
+DEFAULT_MIN_VOLATILITY = 0.005
+YFINANCE_MISSING = "Screening needs the yfinance package (a core dependency): pip install -e ."
 
 DEFAULT_OUTPUT = "src/market_watcher/research/target_stocks.yaml"
 IWV_PRODUCT_PAGE = "https://www.ishares.com/us/products/239714/ishares-russell-3000-etf"
@@ -85,19 +89,29 @@ class ScreenResult:
     ranked: list[Ranked]  # every eligible stock, most volatile first
     skipped: Counter
     top: int
+    no_options: set = field(default_factory=set)  # tickers found to have no listed options
     universe_size: int = 0
     fetched: int = 0
 
     @property
     def long_straddle(self):
-        """The ``top`` most volatile stocks, most volatile first."""
-        return self.ranked[: self.top]
+        """The ``top`` most volatile stocks with listed options, most volatile first."""
+        return self._pick(self.ranked)
 
     @property
     def short_straddle(self):
-        """The ``top`` least volatile stocks (never overlapping the long list), least volatile first."""
-        start = max(self.top, len(self.ranked) - self.top)
-        return list(reversed(self.ranked[start:]))
+        """The ``top`` least volatile stocks with options (never overlapping the long list), least volatile first."""
+        long_tickers = {item.ticker for item in self.long_straddle}
+        return self._pick(item for item in reversed(self.ranked) if item.ticker not in long_tickers)
+
+    def _pick(self, candidates):
+        picked = []
+        for item in candidates:
+            if len(picked) >= self.top:
+                break
+            if item.ticker not in self.no_options:
+                picked.append(item)
+        return picked
 
 
 # --- Volatility ------------------------------------------------------------------------------------------------------
@@ -139,8 +153,20 @@ def average_dollar_volume(history, days=DOLLAR_VOLUME_DAYS):
     return statistics.fmean(close * volume for close, volume in pairs)
 
 
-def screen(histories, top=50, min_price=5.0, min_dollar_volume=5_000_000.0):
-    """Ranks ``histories`` (ticker -> History) by weighted volatility after applying the liquidity filters."""
+def screen(
+    histories,
+    top=50,
+    min_price=5.0,
+    min_dollar_volume=5_000_000.0,
+    min_volatility=DEFAULT_MIN_VOLATILITY,
+    has_options=None,
+):
+    """Ranks ``histories`` (ticker -> History) by weighted volatility after applying the filters.
+
+    ``has_options(ticker)`` (True, False, or None when unknown) is asked only about the
+    candidates at either end of the ranking, until ``top`` per side qualify: a straddle
+    cannot be opened on a stock without listed options, so those are skipped.
+    """
     ranked = []
     skipped = Counter()
     for ticker, history in histories.items():
@@ -156,10 +182,41 @@ def screen(histories, top=50, min_price=5.0, min_dollar_volume=5_000_000.0):
         if dollar_volume < min_dollar_volume:
             skipped[f"average dollar volume below {min_dollar_volume:,.0f}"] += 1
             continue
-        ranked.append(Ranked(ticker, weighted_volatility(vols), vols, last_close, dollar_volume))
+        volatility = weighted_volatility(vols)
+        if volatility < min_volatility:
+            skipped[f"weighted volatility below {min_volatility:.1%} (likely pinned to a takeover price)"] += 1
+            continue
+        ranked.append(Ranked(ticker, volatility, vols, last_close, dollar_volume))
 
     ranked.sort(key=lambda item: (-item.weighted_volatility, item.ticker))
-    return ScreenResult(ranked=ranked, skipped=skipped, top=top)
+    result = ScreenResult(ranked=ranked, skipped=skipped, top=top)
+    if has_options is not None:
+        _check_options(result, has_options)
+    return result
+
+
+def _check_options(result, has_options):
+    """Asks ``has_options`` about the candidates at both ends of the ranking until ``top`` per side qualify.
+
+    Walks the ranking the same way the ``long_straddle`` / ``short_straddle`` properties do,
+    recording the tickers without options in ``result.no_options`` as it goes; an unknown
+    answer (None) keeps the candidate.
+    """
+
+    def walk(candidates):
+        picked = 0
+        for item in candidates:
+            if picked >= result.top:
+                break
+            if has_options(item.ticker) is False:
+                result.no_options.add(item.ticker)
+                result.skipped["no listed options"] += 1
+            else:
+                picked += 1
+
+    walk(result.ranked)
+    long_tickers = {item.ticker for item in result.long_straddle}
+    walk(item for item in reversed(result.ranked) if item.ticker not in long_tickers)
 
 
 # --- Universe --------------------------------------------------------------------------------------------------------
@@ -315,7 +372,7 @@ def fetch_history(tickers, period="3mo", batch_size=200):
     try:
         import yfinance
     except ImportError:
-        raise RuntimeError("Screening needs the yfinance package (a core dependency): pip install -e .") from None
+        raise RuntimeError(YFINANCE_MISSING) from None
 
     quiet_yfinance_logging()
     tickers = list(tickers)
@@ -328,6 +385,21 @@ def fetch_history(tickers, period="3mo", batch_size=200):
         )
         histories.update(histories_from_frame(data, batch))
     return histories
+
+
+def yfinance_has_options(ticker):
+    """Whether Yahoo Finance lists option expirations for ``ticker`` (one request); None when it could not tell."""
+    try:
+        import yfinance
+    except ImportError:
+        raise RuntimeError(YFINANCE_MISSING) from None
+
+    quiet_yfinance_logging()
+    try:
+        return bool(yfinance.Ticker(ticker).options)
+    except Exception as e:  # a network hiccup must not drop a candidate
+        logger.warning("Could not check whether %s has listed options (%s); keeping it", ticker, e)
+        return None
 
 
 # --- Output ----------------------------------------------------------------------------------------------------------
@@ -394,14 +466,19 @@ def run(
     top=50,
     min_price=5.0,
     min_dollar_volume=5_000_000.0,
+    min_volatility=DEFAULT_MIN_VOLATILITY,
+    require_options=True,
     output=DEFAULT_OUTPUT,
     report=None,
     load=None,
     fetch=None,
+    has_options=None,
 ):
     """Loads the universe, fetches prices, screens, and writes the target stocks file (and optionally a report)."""
     load = load or load_universe
     fetch = fetch or fetch_history
+    if has_options is None and require_options:
+        has_options = yfinance_has_options
 
     tickers = load(universe)
     histories = fetch(tickers)
@@ -410,7 +487,14 @@ def run(
             f"No price history came back for any of the {len(tickers)} tickers in the universe; "
             "is Yahoo Finance reachable?"
         )
-    result = screen(histories, top=top, min_price=min_price, min_dollar_volume=min_dollar_volume)
+    result = screen(
+        histories,
+        top=top,
+        min_price=min_price,
+        min_dollar_volume=min_dollar_volume,
+        min_volatility=min_volatility,
+        has_options=has_options,
+    )
     result.universe_size = len(tickers)
     result.fetched = len(histories)
 
@@ -419,7 +503,11 @@ def run(
     if len(result.ranked) < 2 * top:
         logger.warning("Only %d eligible stocks for 2 x %d slots; the lists will be shorter", len(result.ranked), top)
 
-    parameters = f"top {top} per strategy, min price {min_price:g}, min average dollar volume {min_dollar_volume:,.0f}"
+    options = "listed options required" if has_options else "options not checked"
+    parameters = (
+        f"top {top} per strategy, min price {min_price:g}, min average dollar volume {min_dollar_volume:,.0f}, "
+        f"min volatility {min_volatility:.1%}, {options}"
+    )
     write_target_stocks(output, result, universe=universe, parameters=parameters)
     if report:
         write_report(report, result)

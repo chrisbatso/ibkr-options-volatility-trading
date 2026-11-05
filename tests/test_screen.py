@@ -1,3 +1,4 @@
+import logging
 import math
 import sys
 import urllib.error
@@ -28,6 +29,7 @@ from market_watcher.screen import (
     weighted_volatility,
     write_report,
     write_target_stocks,
+    yfinance_has_options,
 )
 
 LONG = STRATEGIES.LONG_STRADDLE.value
@@ -134,6 +136,44 @@ def test_ties_are_broken_alphabetically():
     result = screen({"B": history(0.02), "A": history(0.02)}, top=1, min_dollar_volume=0)
 
     assert [item.ticker for item in result.ranked] == ["A", "B"]
+
+
+def test_screen_skips_stocks_pinned_to_a_takeover_price():
+    histories = {"WILD": history(0.03), "CALM": history(0.01), "PINNED": history(0.0005)}  # ~0.1% daily moves
+
+    result = screen(histories, top=1)
+
+    assert [item.ticker for item in result.short_straddle] == ["CALM"]
+    assert result.skipped == Counter({"weighted volatility below 0.5% (likely pinned to a takeover price)": 1})
+
+    raw = screen(histories, top=1, min_volatility=0)
+
+    assert [item.ticker for item in raw.short_straddle] == ["PINNED"]
+
+
+def test_screen_skips_candidates_without_listed_options_and_asks_only_about_the_ends():
+    histories = {f"T{a}": history(a / 100) for a in range(1, 9)}
+    asked = []
+
+    def has_options(ticker):
+        asked.append(ticker)
+        return ticker not in {"T8", "T1"}
+
+    result = screen(histories, top=2, has_options=has_options)
+
+    assert [item.ticker for item in result.long_straddle] == ["T7", "T6"]
+    assert [item.ticker for item in result.short_straddle] == ["T2", "T3"]
+    assert result.skipped == Counter({"no listed options": 2})
+    assert sorted(asked) == ["T1", "T2", "T3", "T6", "T7", "T8"]  # the middle of the ranking is never asked about
+    assert [item.ticker for item in result.ranked][:2] == ["T8", "T7"]  # still ranked, so still in the report
+
+
+def test_screen_keeps_a_candidate_whose_options_could_not_be_checked():
+    result = screen({f"T{a}": history(a / 100) for a in (1, 2, 3)}, top=1, has_options=lambda ticker: None)
+
+    assert [item.ticker for item in result.long_straddle] == ["T3"]
+    assert [item.ticker for item in result.short_straddle] == ["T1"]
+    assert result.skipped == Counter()
 
 
 # --- Universe --------------------------------------------------------------------------------------------------------
@@ -333,6 +373,31 @@ def test_fetch_history_explains_the_missing_dependency(monkeypatch):
 
     with pytest.raises(RuntimeError, match=r"yfinance.*pip install -e \."):
         fetch_history(["AAPL"])
+    with pytest.raises(RuntimeError, match=r"yfinance.*pip install -e \."):
+        yfinance_has_options("AAPL")
+
+
+class FakeTicker:
+    expirations = {"AAPL": ("2026-11-20", "2026-12-18"), "VCIG": ()}
+
+    def __init__(self, symbol):
+        self.symbol = symbol
+
+    @property
+    def options(self):
+        if self.symbol == "DOWN":
+            raise OSError("rate limited")
+        return self.expirations[self.symbol]
+
+
+def test_yfinance_has_options_reads_the_expirations_and_shrugs_at_errors(monkeypatch, caplog):
+    monkeypatch.setattr("yfinance.Ticker", FakeTicker)
+
+    assert yfinance_has_options("AAPL") is True
+    assert yfinance_has_options("VCIG") is False
+    with caplog.at_level(logging.WARNING, logger="market_watcher.screen"):
+        assert yfinance_has_options("DOWN") is None
+    assert "Could not check whether DOWN has listed options (rate limited); keeping it" in caplog.text
 
 
 # --- Output ----------------------------------------------------------------------------------------------------------
@@ -391,6 +456,7 @@ def test_run_writes_the_target_stocks_and_the_report(tmp_path):
         universe="universe.txt",
         top=1,
         min_dollar_volume=0,
+        require_options=False,
         output=output,
         report=report,
         load=lambda source: universe,
@@ -399,7 +465,26 @@ def test_run_writes_the_target_stocks_and_the_report(tmp_path):
 
     assert (result.universe_size, result.fetched, len(result.ranked)) == (5, 4, 4)
     assert get_target_stocks(output) == {"T4": {"strategy": LONG}, "T1": {"strategy": SHORT}}
+    assert "min volatility 0.5%, options not checked" in output.read_text()
     assert report.read_text().count("\n") == 5  # header + 4 stocks
+
+
+def test_run_selects_around_stocks_without_options(tmp_path):
+    histories = {f"T{a}": history(a / 100) for a in (1, 2, 3, 4)}
+    output = tmp_path / "stocks.yaml"
+
+    result = run(
+        universe="x",
+        top=1,
+        output=output,
+        load=lambda source: list(histories),
+        fetch=lambda tickers: histories,
+        has_options=lambda ticker: ticker != "T4",
+    )
+
+    assert get_target_stocks(output) == {"T3": {"strategy": LONG}, "T1": {"strategy": SHORT}}
+    assert result.skipped == Counter({"no listed options": 1})
+    assert "listed options required" in output.read_text()
 
 
 def test_run_explains_when_no_prices_came_back(tmp_path):
@@ -414,10 +499,13 @@ def test_run_refuses_to_write_an_empty_file(tmp_path):
         run(universe="x", output=tmp_path / "out.yaml", load=lambda source: ["T1"], fetch=lambda tickers: cheap)
 
 
-def test_run_uses_the_module_level_loader_and_fetcher_by_default(monkeypatch, tmp_path):
+def test_run_uses_the_module_level_loader_fetcher_and_options_check_by_default(monkeypatch, tmp_path):
+    asked = []
     monkeypatch.setattr(screen_module, "load_universe", lambda source: ["T1", "T2"])
     monkeypatch.setattr(screen_module, "fetch_history", lambda tickers: {"T1": history(0.01), "T2": history(0.03)})
+    monkeypatch.setattr(screen_module, "yfinance_has_options", lambda ticker: asked.append(ticker) or True)
 
     result = run(top=1, min_dollar_volume=0, output=tmp_path / "out.yaml")
 
     assert [item.ticker for item in result.long_straddle] == ["T2"]
+    assert asked == ["T2", "T1"]

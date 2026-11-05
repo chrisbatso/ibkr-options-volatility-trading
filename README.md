@@ -145,6 +145,8 @@ pytest
 
 `market_watcher_cli screen` reproduces the research step. It downloads the iShares Russell 3000 ETF (IWV) holdings as the universe, fetches three months of daily split-adjusted prices from Yahoo Finance, computes the volatility (standard deviation of daily log returns) over the last 5, 10 and 21 trading days, combines them as `0.5 * vol_5d + 0.3 * vol_10d + 0.2 * vol_21d`, and writes the 50 most volatile stocks as long straddle candidates and the 50 least volatile as short straddle candidates to `src/market_watcher/research/target_stocks.yaml`. Stocks below $5 or with less than $5M average daily dollar volume are skipped (penny stocks have noisy volatility and rarely have tradable options); tune that with `--min-price` / `--min-dollar-volume`, and the list size with `--top`.
 
+Two more filters guard the ends of the ranking, where the artifacts live. Stocks whose weighted volatility is below 0.5% are skipped: a stock that flat is almost always pinned to a pending cash takeover, which leaves no premium to sell and a gap if the deal breaks (`--min-volatility 0` disables this). And only stocks with listed options are selected, since a straddle cannot be opened otherwise: candidates are checked from either end of the ranking, one Yahoo Finance request each, until both lists are full (`--no-require-options` skips the check). The summary reports how many stocks each filter removed.
+
 ```bash
 market_watcher_cli screen --report screen_report.csv
 ```
