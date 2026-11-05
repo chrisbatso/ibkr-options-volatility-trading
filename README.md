@@ -119,7 +119,7 @@ To use the `ibkr` provider from the container, set `IBKR_HOST=host.docker.intern
 
 ### 2. Running in a virtual environment
 
-Requires Python 3.10 or newer. Create and activate a virtual environment:
+Requires Python 3.10 or newer (CI runs 3.10 to 3.14). Create and activate a virtual environment:
 
 ```bash
 python3 -m venv .venv
