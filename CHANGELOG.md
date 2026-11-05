@@ -22,8 +22,8 @@ state, then extended with the Interactive Brokers integration it always promised
   combo orders staged in TWS for manual transmit, paper accounts only, long
   straddles only, with premium / notional / per-day caps and a dry-run mode.
 - **Position management** for the trader: fill tracking, take-profit / stop-loss /
-  end-of-day exits, daily loss limit, risk-based sizing, and a book rebuilt from the
-  day's executions after a restart.
+  end-of-day exits, daily loss limit, risk-based sizing, and a book reconciled with IB
+  after a restart or a lost connection.
 - `market_watcher_cli doctor`: checks settings, target stocks, market hours, the data
   source, Slack, email and the TWS connection before `start`.
 - Trade events and an end-of-day summary are sent through the Slack / email

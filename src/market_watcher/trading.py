@@ -10,8 +10,8 @@ Open straddles are then managed on every polling cycle (``manage_positions`` is 
 engine cycle hook): entries are tracked until IB reports them filled, positions are
 valued at the legs' bid/ask midpoints and closed with the opposite combo order on a
 take-profit, a stop-loss, shortly before the session close (unless held overnight),
-or when the day's loss limit is hit. After a restart the book is rebuilt from the
-day's executions tagged with our order reference.
+or when the day's loss limit is hit. After a restart or a lost connection the book
+is reconciled with IB's positions, open orders and the day's executions.
 
 Safety rails, all configurable (see TradingSettings):
 
@@ -310,6 +310,31 @@ def exit_limit(position, quote, reason, buffer_pct):
 # --- Trader ----------------------------------------------------------------------------------------------------------
 
 
+def _fills_by_leg(fills, order_ref):
+    """Shares and cost per option conId among today's executions tagged with ``order_ref``."""
+    by_leg = {}
+    for fill in fills:
+        if getattr(fill.execution, "orderRef", "") != order_ref:
+            continue
+        shares, cost = by_leg.get(fill.contract.conId, (0.0, 0.0))
+        by_leg[fill.contract.conId] = (
+            shares + fill.execution.shares,
+            cost + fill.execution.shares * fill.execution.price,
+        )
+    return by_leg
+
+
+def _fill_price(by_leg, position):
+    """Average net price per unit of ``position``'s two legs from ``by_leg``, or None without fills for both."""
+    total = 0.0
+    for leg in (position.call, position.put):
+        shares, cost = by_leg.get(leg.conId, (0.0, 0.0))
+        if not shares:
+            return None
+        total += cost / shares
+    return total
+
+
 class IBKRStraddleTrader:
     """Places ATM straddle combo orders on IBKR for new opportunities and manages them until they are closed.
 
@@ -327,7 +352,7 @@ class IBKRStraddleTrader:
         self._placed_today = {}
         self._halted_on = None  # the day the daily loss limit was hit
         self._realized = []  # (day, ticker, USD)
-        self._book_synced = False
+        self._needs_sync = False  # set by _connect() on every new connection: reconcile the book with IB first
         self._summarized_on = None
 
     # Notifier interface ---------------------------------------------------------------------------------------------
@@ -522,10 +547,10 @@ class IBKRStraddleTrader:
         settings = self.settings
 
         ib = self._connect()
-        if not self._book_synced:
-            if not settings.dry_run:
-                self._rebuild_book(ib, today)
-            self._book_synced = True
+        if self._needs_sync:
+            if not settings.dry_run:  # dry-run positions are virtual: IB knows nothing about them
+                self._sync_book(ib, today)
+            self._needs_sync = False
         self._refresh_orders(ib, today)
         near_close = now >= session.close - timedelta(minutes=settings.exit_minutes_before_close)
         if not self.positions:
@@ -602,17 +627,7 @@ class IBKRStraddleTrader:
                 status = trade.orderStatus.status
                 if status == FILLED:
                     price = trade.orderStatus.avgFillPrice or position.exit_price
-                    pnl = unrealized_pnl(position, price)
-                    self._realized.append((today, ticker, pnl))
-                    del self.positions[ticker]
-                    self._announce(
-                        "Straddle closed",
-                        f"{ticker} closed at {price:.2f} ({position.exit_reason}): {pnl:+,.0f} USD; "
-                        f"realized today {self.realized_today(today):+,.0f} USD",
-                    )
-                    logger.info(
-                        "Closed the %s straddle at %.2f (%s): %+.0f USD", ticker, price, position.exit_reason, pnl
-                    )
+                    self._record_close(position, price, today, position.exit_reason)
                 elif status in DEAD_ORDER_STATUSES:
                     logger.warning(
                         "Exit order %s for %s was cancelled; it will be placed again", trade.order.orderId, ticker
@@ -665,6 +680,72 @@ class IBKRStraddleTrader:
             f"{ticker}: {action} {position.spec.quantity} at {limit:.2f} ({reason}) - order id {trade.order.orderId}",
         )
 
+    def _record_close(self, position, price, today, how):
+        """Books the realized P&L of a closed straddle, drops it from the book and announces it."""
+        ticker = position.spec.ticker
+        pnl = unrealized_pnl(position, price)
+        self._realized.append((today, ticker, pnl))
+        self.positions.pop(ticker, None)
+        self._announce(
+            "Straddle closed",
+            f"{ticker} closed at {price:.2f} ({how}): {pnl:+,.0f} USD; "
+            f"realized today {self.realized_today(today):+,.0f} USD",
+        )
+        logger.info("Closed the %s straddle at %.2f (%s): %+.0f USD", ticker, price, how, pnl)
+
+    def _sync_book(self, ib, today):
+        """Reconciles the book with IB after a (re)connection.
+
+        Applies the fills, cancellations and closes that happened while disconnected, using
+        IB's positions, open orders and the day's executions, then recovers straddles opened
+        by an earlier run (see _rebuild_book).
+        """
+        fills = list(ib.reqExecutions())
+        held = {position.contract.conId for position in ib.positions() if position.position}
+        open_order_ids = {trade.order.orderId for trade in ib.trades()}
+        entry_fills = _fills_by_leg(fills, ORDER_REF)
+        exit_fills = _fills_by_leg(fills, EXIT_REF)
+
+        for ticker, position in list(self.positions.items()):
+            legs_held = position.call.conId in held and position.put.conId in held
+            if position.exit_order_id is not None:
+                if not legs_held:
+                    price = _fill_price(exit_fills, position) or position.exit_price
+                    self._record_close(position, price, today, f"{position.exit_reason}; fill detected after reconnect")
+                elif position.exit_order_id not in open_order_ids:
+                    logger.warning(
+                        "Exit order %s for %s is gone after the reconnect; it will be placed again",
+                        position.exit_order_id,
+                        ticker,
+                    )
+                    position.exit_order_id = position.exit_price = position.exit_reason = None
+            elif position.filled:
+                if not legs_held:
+                    price = _fill_price(exit_fills, position)
+                    if price is None:
+                        logger.warning(
+                            "%s is no longer held and no exit fill was found; dropping it from the book", ticker
+                        )
+                        del self.positions[ticker]
+                    else:
+                        self._record_close(position, price, today, "closed while disconnected")
+            elif legs_held:
+                position.filled = True
+                position.entry_price = _fill_price(entry_fills, position) or position.entry_price
+                logger.info(
+                    "Entry filled while disconnected: %s at %.2f", position.spec.describe(), position.entry_price
+                )
+                self._announce(
+                    "Straddle entry filled", f"{position.spec.describe()}\nFilled at {position.entry_price:.2f}"
+                )
+            elif position.entry_order_id not in open_order_ids:
+                logger.warning(
+                    "Entry order %s for %s is gone after the reconnect; forgetting it", position.entry_order_id, ticker
+                )
+                del self.positions[ticker]
+
+        self._rebuild_book(ib, today, fills=fills, held=held)
+
     def _cancel_entry(self, ib, position):
         ticker = position.spec.ticker
         for trade in ib.trades():
@@ -673,14 +754,17 @@ class IBKRStraddleTrader:
         del self.positions[ticker]
         logger.info("Cancelled the unfilled entry for %s (order id %s)", ticker, position.entry_order_id)
 
-    def _rebuild_book(self, ib, today):
+    def _rebuild_book(self, ib, today, fills=None, held=None):
         """Recovers straddles opened today by an earlier run from IB's executions tagged with our order reference."""
         from ib_async import Bag, ComboLeg
 
-        fills = [fill for fill in ib.reqExecutions() if getattr(fill.execution, "orderRef", "") == ORDER_REF]
+        if fills is None:
+            fills = list(ib.reqExecutions())
+        fills = [fill for fill in fills if getattr(fill.execution, "orderRef", "") == ORDER_REF]
         if not fills:
             return
-        held = {position.contract.conId for position in ib.positions() if position.position}
+        if held is None:
+            held = {position.contract.conId for position in ib.positions() if position.position}
         by_order = {}
         for fill in fills:
             by_order.setdefault(fill.execution.orderId, []).append(fill)
@@ -777,4 +861,5 @@ class IBKRStraddleTrader:
             ", ".join(accounts),
         )
         self._ib = ib
+        self._needs_sync = True  # a new connection: reconcile the book with it before acting on it
         return ib

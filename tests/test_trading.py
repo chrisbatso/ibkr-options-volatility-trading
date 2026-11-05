@@ -884,3 +884,116 @@ def test_end_of_day_summary_is_announced_once_near_the_close(fake_ib):
     assert len(summaries) == 1
     assert summaries[0].startswith("Realized P&L: +310 USD over 1 closed straddle(s)")
     assert ib.cancelled == [3]  # the unfilled MSFT entry was cancelled at the close
+
+
+# --- Reconnect reconciliation ----------------------------------------------------------------------------------------
+
+
+def disconnect(ib):
+    ib.connected = False
+
+
+def leg_fill(con_id, right, price, ref, side="SLD", order_id=99):
+    return execution(con_id, right, order_id, price, side=side, ref=ref)
+
+
+def held_legs(*con_ids):
+    return [SimpleNamespace(contract=SimpleNamespace(conId=con_id), position=1) for con_id in con_ids]
+
+
+def test_exit_filled_while_disconnected_is_realized_after_the_reconnect(fake_ib):
+    announcer = RecordingAnnouncer()
+    trader = announcing_trader(announcer)
+    trader.place_straddle("AAPL", LONG)
+    [ib] = fake_ib.instances
+    ib.trade_objects[0].fill(6.0)
+    quote_atm(5.0, 5.2, 4.0, 4.2)
+    trader.manage_positions(NOW, SESSION)  # take-profit exit placed
+    disconnect(ib)
+    fake_ib.held = []  # the legs are gone: the exit filled meanwhile
+    fake_ib.executions = [leg_fill(1001, "C", 5.0, EXIT_REF), leg_fill(1002, "P", 4.1, EXIT_REF)]
+
+    trader.manage_positions(NOW, SESSION)
+
+    assert len(fake_ib.instances) == 2  # reconnected
+    assert trader.positions == {}
+    assert trader.realized_today(TODAY) == pytest.approx((9.1 - 6.0) * 100)
+    closed = [text for subject, text in announcer.messages if subject == "Straddle closed"]
+    assert len(closed) == 1 and "fill detected after reconnect" in closed[0]
+
+
+def test_exit_order_lost_in_the_reconnect_is_placed_again(fake_ib):
+    trader, ib = open_long()
+    ib.trade_objects[0].fill(6.0)
+    quote_atm(5.0, 5.2, 4.0, 4.2)
+    trader.manage_positions(NOW, SESSION)
+    disconnect(ib)
+    fake_ib.held = held_legs(1001, 1002)  # still open, but the new connection knows no such order
+
+    trader.manage_positions(NOW, SESSION)
+
+    [(_, exit_order)] = fake_ib.instances[1].orders
+    assert exit_order.action == "SELL" and exit_order.orderRef == EXIT_REF
+    assert trader.positions["AAPL"].exit_order_id == exit_order.orderId
+
+
+def test_entry_filled_while_disconnected_is_picked_up(fake_ib):
+    trader, ib = open_long()  # entry pending
+    disconnect(ib)
+    fake_ib.held = held_legs(1001, 1002)
+    fake_ib.executions = [
+        leg_fill(1001, "C", 3.05, ORDER_REF, side="BOT", order_id=1),
+        leg_fill(1002, "P", 2.95, ORDER_REF, side="BOT", order_id=1),
+    ]
+
+    trader.manage_positions(NOW, SESSION)
+
+    [position] = trader.positions.values()
+    assert position.filled and position.entry_price == pytest.approx(6.0)
+
+
+def test_position_closed_by_hand_while_disconnected_is_dropped(fake_ib):
+    trader, ib = open_long()
+    ib.trade_objects[0].fill(6.0)
+    trader.manage_positions(NOW, SESSION)
+    disconnect(ib)
+    fake_ib.held = []  # closed manually in TWS: no MarketWatcher exit fill
+
+    trader.manage_positions(NOW, SESSION)
+
+    assert trader.positions == {}
+    assert trader.realized_today(TODAY) == 0
+
+
+def test_entry_cancelled_while_disconnected_is_forgotten(fake_ib):
+    trader, ib = open_long()
+    disconnect(ib)
+    fake_ib.held = []
+
+    trader.manage_positions(NOW, SESSION)
+
+    assert trader.positions == {}
+
+
+def test_untouched_positions_survive_a_reconnect(fake_ib):
+    trader, ib = open_long()
+    ib.trade_objects[0].fill(6.0)
+    trader.manage_positions(NOW, SESSION)
+    disconnect(ib)
+    fake_ib.held = held_legs(1001, 1002)
+
+    trader.manage_positions(NOW, SESSION)
+
+    position = trader.positions["AAPL"]
+    assert position.filled and position.exit_order_id is None and position.entry_price == 6.0
+
+
+def test_dry_run_positions_survive_a_reconnect(fake_ib):
+    trader = make_trader(dry_run=True)
+    trader.place_straddle("AAPL", LONG)
+    disconnect(fake_ib.instances[0])
+    fake_ib.held = []
+
+    trader.manage_positions(NOW, SESSION)
+
+    assert "AAPL" in trader.positions
