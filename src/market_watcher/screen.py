@@ -273,7 +273,11 @@ def load_universe(source="iwv"):
             tickers.extend(parse_nasdaq_directory(download_text(url)))
         tickers = list(dict.fromkeys(tickers))
     else:
-        tickers = parse_universe(Path(source).read_text(encoding="utf-8-sig"))
+        path = Path(source)
+        if not path.is_file():
+            choices = " or ".join(f"'{name}'" for name in UNIVERSES)
+            raise ValueError(f"universe {source!r} is not a file; use {choices}, or the path of a saved ticker list")
+        tickers = parse_universe(path.read_text(encoding="utf-8-sig"))
     if not tickers:
         raise ValueError(f"No tickers found in universe {source!r}")
     return tickers

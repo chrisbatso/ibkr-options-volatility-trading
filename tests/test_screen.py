@@ -299,6 +299,13 @@ def test_load_universe_reads_a_local_file_and_rejects_html(tmp_path):
         load_universe(str(path))
 
 
+def test_load_universe_names_the_choices_for_a_missing_file(tmp_path):
+    with pytest.raises(ValueError, match=r"'nasdq' is not a file; use 'iwv' or 'nasdaq', or the path"):
+        load_universe("nasdq")
+    with pytest.raises(ValueError, match="is not a file"):
+        load_universe(str(tmp_path / "Downloads" / "IWV_holdings.csv"))
+
+
 # --- Prices ----------------------------------------------------------------------------------------------------------
 
 
