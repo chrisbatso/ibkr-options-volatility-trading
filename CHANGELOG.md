@@ -45,7 +45,9 @@ state, then extended with the Interactive Brokers integration it always promised
 - A 0.0 % daily move (the strongest short-straddle signal) was skipped as "no data";
   tickers missing from the data source raised `KeyError`.
 - Multi-recipient emails were sent to a single malformed address; the `From` header
-  was missing; empty reports were emailed every cycle.
+  was missing; empty reports were emailed every cycle; SMTP servers on port 587 (or
+  any port other than 465) were unreachable because every port was treated as
+  implicit TLS instead of STARTTLS.
 - Slack HTTP errors were handled with `assert`; YAML loading errors were swallowed;
   missing `.env` values surfaced as bare `KeyError`s; `config` printed the SMTP
   password.
