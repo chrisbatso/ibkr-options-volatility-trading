@@ -10,9 +10,8 @@ and pick the N most volatile stocks as long straddle candidates and the N least
 volatile as short straddle candidates.
 
 Volatility is the sample standard deviation of daily log returns. It is not
-annualised: that is a constant factor and does not change the ranking. Fetching
-prices needs the optional ``research`` extra (``pip install "market_watcher[research]"``,
-which brings yfinance); everything else is standard library.
+annualised: that is a constant factor and does not change the ranking. Prices come
+from Yahoo Finance through yfinance; everything else is standard library.
 """
 
 import csv
@@ -40,13 +39,28 @@ REQUIRED_CLOSES = max(WINDOWS) + 1
 DOLLAR_VOLUME_DAYS = max(WINDOWS)
 
 DEFAULT_OUTPUT = "src/market_watcher/research/target_stocks.yaml"
-IWV_HOLDINGS_URL = (
-    "https://www.ishares.com/us/products/239714/ishares-russell-3000-etf/1467271812596.ajax"
-    "?fileType=csv&fileName=IWV_holdings&dataType=fund"
+IWV_PRODUCT_PAGE = "https://www.ishares.com/us/products/239714/ishares-russell-3000-etf"
+IWV_HOLDINGS_URL = f"{IWV_PRODUCT_PAGE}/1467271812596.ajax?fileType=csv&fileName=IWV_holdings&dataType=fund"
+# Every security listed on a US exchange, maintained by Nasdaq: the Nasdaq-listed ones and the other exchanges.
+NASDAQ_TRADER_URLS = (
+    "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt",
+    "https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt",
 )
+UNIVERSES = ("iwv", "nasdaq")
+# Downloads identify themselves honestly. A site that wants a browser answers a script with an HTML bot check or
+# consent page instead of the file; download_text() reports that rather than parsing it (or working around it).
+DOWNLOAD_HEADERS = {"User-Agent": f"market_watcher/{VERSION}", "Accept": "text/csv,text/plain;q=0.9,*/*;q=0.8"}
 
 # Yahoo-style tickers: AAPL, BRK-B, RDS-A; share classes are separated by '-'.
 TICKER_PATTERN = re.compile(r"^[A-Z0-9]{1,6}(-[A-Z0-9]{1,3})?$")
+# Nasdaq Integrated symbology: letters, optionally '.X' for a share class. '-' (preferred), '+' (warrant),
+# '=' (unit), '^' (right) and '#' (when issued) mark securities that are not common stock.
+NASDAQ_STOCK_PATTERN = re.compile(r"^[A-Z]{1,5}(\.[A-Z])?$")
+# Securities whose name says they are not common stock, whatever their symbol looks like.
+NOT_A_STOCK = re.compile(
+    r"\b(warrants?|rights?|units?|preferred|preference|notes?|debentures?|bonds?|funds?|etns?|when[- ]issued)\b",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -161,12 +175,20 @@ def _first_field(line):
     return next(csv.reader([line]), [""])[0].strip() if line else ""
 
 
+def looks_like_html(text):
+    """True for an HTML document: what a download gets instead of the data when a site wants a browser."""
+    head = text[:2048].lstrip().lower()
+    return head.startswith("<") or "<html" in head or "<!doctype" in head
+
+
 def parse_universe(text):
     """Tickers from a plain list (one per line), a CSV with a Ticker or Symbol column, or an iShares holdings export.
 
     iShares exports start with a few preamble lines and end with a disclaimer; both are
     ignored, and only rows whose ``Asset Class`` is ``Equity`` are kept.
     """
+    if looks_like_html(text):
+        raise ValueError("the universe is an HTML page, not a list of tickers")
     lines = [line.strip() for line in text.splitlines()]
     header = next((index for index, line in enumerate(lines) if _first_field(line) in ("Ticker", "Symbol")), None)
     if header is None:
@@ -187,16 +209,71 @@ def parse_universe(text):
     return tickers
 
 
+def parse_nasdaq_directory(text):
+    """Common-stock tickers (Yahoo style) from a Nasdaq Trader symbol directory file.
+
+    ``nasdaqlisted.txt`` and ``otherlisted.txt`` are pipe-delimited, cover every security on
+    a US exchange and end with a ``File Creation Time`` line. ETFs, test issues, bankrupt
+    issuers and anything that is not common stock (warrants, rights, units, preferreds,
+    notes, funds) are dropped.
+    """
+    if looks_like_html(text):
+        raise ValueError("the symbol directory is an HTML page, not a Nasdaq Trader file")
+    lines = [line for line in text.splitlines() if line.strip() and not line.startswith("File Creation Time")]
+    reader = csv.DictReader(lines, delimiter="|")
+    column = next((name for name in ("NASDAQ Symbol", "Symbol") if name in (reader.fieldnames or [])), None)
+    if column is None:
+        raise ValueError("not a Nasdaq Trader symbol directory: no Symbol column")
+
+    tickers = []
+    for row in reader:
+        symbol = (row.get(column) or "").strip()
+        if not NASDAQ_STOCK_PATTERN.match(symbol):
+            continue
+        if (row.get("ETF") or "").strip() == "Y" or (row.get("Test Issue") or "").strip() == "Y":
+            continue
+        if any(flag in (row.get("Financial Status") or "") for flag in "QGJK"):  # bankrupt, alone or combined
+            continue
+        if NOT_A_STOCK.search(row.get("Security Name") or ""):
+            continue
+        ticker = normalize_ticker(symbol)
+        if ticker:
+            tickers.append(ticker)
+    return list(dict.fromkeys(tickers))
+
+
+def download_text(url, timeout=60):
+    """The text at ``url``; raises if the site answered with an HTML page instead of the data file."""
+    request = urllib.request.Request(url, headers=DOWNLOAD_HEADERS)
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        text = response.read().decode("utf-8-sig", errors="replace")
+    if looks_like_html(text):
+        raise ValueError(f"{url} answered with an HTML page instead of the data file")
+    return text
+
+
 def load_universe(source="iwv"):
-    """Tickers from the iShares Russell 3000 ETF holdings (``iwv``) or from a local file."""
-    if source.strip().lower() == "iwv":
+    """Tickers from the iShares Russell 3000 ETF holdings (``iwv``), the Nasdaq Trader symbol directory of every
+    US-listed stock (``nasdaq``), or a local file."""
+    name = source.strip().lower()
+    if name == "iwv":
         logger.info("Downloading the iShares Russell 3000 ETF (IWV) holdings")
-        request = urllib.request.Request(IWV_HOLDINGS_URL, headers={"User-Agent": f"market_watcher/{VERSION}"})
-        with urllib.request.urlopen(request, timeout=60) as response:
-            text = response.read().decode("utf-8-sig")
+        try:
+            tickers = parse_universe(download_text(IWV_HOLDINGS_URL))
+        except (ValueError, OSError) as e:
+            raise ValueError(
+                f"{e}. iShares does not always serve the file to scripts: save the holdings CSV from "
+                f"{IWV_PRODUCT_PAGE} and pass it with --universe PATH, or screen every US-listed stock with "
+                "--universe nasdaq"
+            ) from e
+    elif name == "nasdaq":
+        logger.info("Downloading the Nasdaq Trader symbol directory (every US-listed stock)")
+        tickers = []
+        for url in NASDAQ_TRADER_URLS:
+            tickers.extend(parse_nasdaq_directory(download_text(url)))
+        tickers = list(dict.fromkeys(tickers))
     else:
-        text = Path(source).read_text(encoding="utf-8-sig")
-    tickers = parse_universe(text)
+        tickers = parse_universe(Path(source).read_text(encoding="utf-8-sig"))
     if not tickers:
         raise ValueError(f"No tickers found in universe {source!r}")
     return tickers
@@ -234,7 +311,7 @@ def fetch_history(tickers, period="3mo", batch_size=200):
     try:
         import yfinance
     except ImportError:
-        raise RuntimeError('Screening needs the yfinance package: pip install "market_watcher[research]"') from None
+        raise RuntimeError("Screening needs the yfinance package (a core dependency): pip install -e .") from None
 
     quiet_yfinance_logging()
     tickers = list(tickers)
@@ -324,6 +401,11 @@ def run(
 
     tickers = load(universe)
     histories = fetch(tickers)
+    if tickers and not histories:
+        raise ValueError(
+            f"No price history came back for any of the {len(tickers)} tickers in the universe; "
+            "is Yahoo Finance reachable?"
+        )
     result = screen(histories, top=top, min_price=min_price, min_dollar_volume=min_dollar_volume)
     result.universe_size = len(tickers)
     result.fetched = len(histories)

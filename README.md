@@ -149,7 +149,9 @@ pytest
 market_watcher_cli screen --report screen_report.csv
 ```
 
-`--report` writes every screened stock with its volatilities for inspection. If the iShares download fails, save the holdings CSV from the [IWV product page](https://www.ishares.com/us/products/239714/ishares-russell-3000-etf) (or any file with one ticker per line) and pass it with `--universe path/to/file.csv`.
+`--report` writes every screened stock with its volatilities for inspection.
+
+The universe is the iShares Russell 3000 ETF (IWV) holdings by default. iShares does not always serve that file to scripts: the download comes back as an HTML page, which the screen reports as such instead of treating it as a universe. When that happens, either save the holdings CSV from the [IWV product page](https://www.ishares.com/us/products/239714/ishares-russell-3000-etf) in your browser and pass it with `--universe path/to/IWV_holdings.csv`, or run `--universe nasdaq`, which screens every common stock listed on a US exchange from the [Nasdaq Trader symbol directory](https://www.nasdaqtrader.com/trader.aspx?id=symboldirdefs) (ETFs, warrants, rights, units, preferreds, notes and funds are excluded; about twice the size of the Russell 3000, so the price download takes longer). Any file with one ticker per line, or a CSV with a `Ticker` or `Symbol` column, also works as a universe.
 
 ### Market data providers
 

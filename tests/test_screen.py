@@ -1,5 +1,6 @@
 import math
 import sys
+import urllib.error
 from collections import Counter
 
 import pytest
@@ -13,9 +14,13 @@ from market_watcher.screen import (
     Ranked,
     ScreenResult,
     average_dollar_volume,
+    download_text,
     fetch_history,
     histories_from_frame,
+    load_universe,
+    looks_like_html,
     normalize_ticker,
+    parse_nasdaq_directory,
     parse_universe,
     run,
     screen,
@@ -174,6 +179,126 @@ def test_parse_universe_handles_a_plain_list_and_a_symbol_column():
     assert parse_universe("Symbol,Name\nKO,Coca-Cola\nPEP,PepsiCo\n") == ["KO", "PEP"]
 
 
+# What iShares answers a script with instead of the CSV; "HTML" on a line of its own used to parse as a ticker.
+HTML_PAGE = '<!DOCTYPE HTML>\n<html lang="en"><head><title>Access Denied</title></head>\n<body>\nHTML\n</body></html>\n'
+
+
+def test_looks_like_html():
+    assert looks_like_html(HTML_PAGE)
+    assert looks_like_html("\n  <html><body>consent</body></html>")
+    assert not looks_like_html('﻿iShares Russell 3000 ETF\nFund Holdings as of,"Oct 31, 2026"\n')
+    assert not looks_like_html("Symbol|Security Name|Market Category\nAAPL|Apple Inc.|Q\n")
+
+
+def test_parse_universe_rejects_an_html_page():
+    with pytest.raises(ValueError, match="HTML page"):
+        parse_universe(HTML_PAGE)
+
+
+NASDAQ_LISTED = """\
+Symbol|Security Name|Market Category|Test Issue|Financial Status|Round Lot Size|ETF|NextShares
+AAPL|Apple Inc. - Common Stock|Q|N|N|100|N|N
+AACGW|ATA Creativity Global - Warrants|G|N|N|100|N|N
+AACIU|Armada Acquisition Corp. I - Unit|G|N|N|100|N|N
+AGNCN|AGNC Investment Corp. - Depositary Shares, 7.00% Series C Preferred Stock|Q|N|N|100|N|N
+BHFAL|Brighthouse Financial, Inc. - 6.25% Junior Subordinated Debentures due 2058|Q|N|N|100|N|N
+QQQ|Invesco QQQ Trust, Series 1|G|N|N|100|Y|N
+ZAZZT|Nasdaq Test Stock|Q|Y|N|100|N|N
+BBBYQ|Bed Bath & Beyond Inc. - Common Stock|Q|N|Q|100|N|N
+NSRGY|Nestle S.A. - American Depositary Shares|Q|N|N|100|N|N
+AAPL|Apple Inc. - Common Stock|Q|N|N|100|N|N
+File Creation Time: 1105202605:01|||||||
+"""
+
+NASDAQ_OTHER_LISTED = """\
+ACT Symbol|Security Name|Exchange|CUSIP|ETF|Round Lot Size|Test Issue|NASDAQ Symbol
+A|Agilent Technologies, Inc. Common Stock|N|00846U101|N|100|N|A
+BRK B|Berkshire Hathaway Inc. Class B Common Stock|N|084670702|N|100|N|BRK.B
+BAC pL|Bank of America Corporation Depositary Shares Preferred Stock|N|060505682|N|100|N|BAC-L
+SPY|SPDR S&P 500 ETF Trust|P|78462F103|Y|100|N|SPY
+NUV|Nuveen Municipal Value Fund, Inc. Common Stock|N|670928100|N|100|N|NUV
+BFAM|Bright Horizons Family Solutions Inc. Common Stock|N|109194100|N|100|N|BFAM
+BX|Blackstone Inc. Common Stock|N|09260D107|N|100|N|BX
+File Creation Time: 1105202605:01|||||||
+"""
+
+
+def test_parse_nasdaq_directory_keeps_listed_common_stock_only():
+    # Dropped: warrants, units, preferreds, debentures (by name), ETFs, test issues, bankrupt issuers, duplicates.
+    assert parse_nasdaq_directory(NASDAQ_LISTED) == ["AAPL", "NSRGY"]
+    # Dropped: a preferred ('-' in the Nasdaq symbol), an ETF, a closed-end fund. "Bright" is not a right.
+    assert parse_nasdaq_directory(NASDAQ_OTHER_LISTED) == ["A", "BRK-B", "BFAM", "BX"]
+
+
+def test_parse_nasdaq_directory_rejects_other_files():
+    with pytest.raises(ValueError, match="HTML page"):
+        parse_nasdaq_directory(HTML_PAGE)
+    with pytest.raises(ValueError, match="Symbol column"):
+        parse_nasdaq_directory("Ticker,Name\nAAPL,Apple\n")
+
+
+class FakeResponse:
+    def __init__(self, body):
+        self.body = body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+    def read(self):
+        return self.body.encode("utf-8")
+
+
+def test_download_text_identifies_itself_and_rejects_html(monkeypatch):
+    requests = []
+
+    def urlopen(request, timeout):
+        requests.append(request)
+        return FakeResponse(HTML_PAGE if "ishares" in request.full_url else "AAPL\nMSFT\n")
+
+    monkeypatch.setattr("urllib.request.urlopen", urlopen)
+
+    assert download_text("https://example.com/list.txt") == "AAPL\nMSFT\n"
+    assert requests[0].get_header("User-agent", "").startswith("market_watcher/")
+    with pytest.raises(ValueError, match="HTML page"):
+        download_text(screen_module.IWV_HOLDINGS_URL)
+
+
+def test_load_universe_iwv_explains_a_refused_download(monkeypatch):
+    def html_page(url):
+        raise ValueError(f"{url} answered with an HTML page instead of the data file")
+
+    monkeypatch.setattr(screen_module, "download_text", html_page)
+    with pytest.raises(ValueError, match=r"HTML page.*save the holdings CSV.*--universe nasdaq"):
+        load_universe("iwv")
+
+    def forbidden(url):
+        raise urllib.error.HTTPError(url, 403, "Forbidden", None, None)
+
+    monkeypatch.setattr(screen_module, "download_text", forbidden)
+    with pytest.raises(ValueError, match=r"HTTP Error 403.*--universe nasdaq"):
+        load_universe("iwv")
+
+
+def test_load_universe_nasdaq_merges_both_directory_files(monkeypatch):
+    nasdaq, other = screen_module.NASDAQ_TRADER_URLS
+    monkeypatch.setattr(screen_module, "download_text", {nasdaq: NASDAQ_LISTED, other: NASDAQ_OTHER_LISTED}.__getitem__)
+
+    assert load_universe("nasdaq") == ["AAPL", "NSRGY", "A", "BRK-B", "BFAM", "BX"]
+
+
+def test_load_universe_reads_a_local_file_and_rejects_html(tmp_path):
+    path = tmp_path / "universe.txt"
+    path.write_text("aapl\nmsft\n")
+    assert load_universe(str(path)) == ["AAPL", "MSFT"]
+
+    path.write_text(HTML_PAGE)
+    with pytest.raises(ValueError, match="HTML page"):
+        load_universe(str(path))
+
+
 # --- Prices ----------------------------------------------------------------------------------------------------------
 
 
@@ -196,10 +321,10 @@ def test_histories_from_a_grouped_yfinance_frame_drops_days_without_a_close():
     assert histories == {"AAPL": History(closes=[100.0, 102.0], volumes=[1_000.0, 0.0])}
 
 
-def test_fetch_history_explains_the_missing_optional_dependency(monkeypatch):
+def test_fetch_history_explains_the_missing_dependency(monkeypatch):
     monkeypatch.setitem(sys.modules, "yfinance", None)  # makes `import yfinance` raise ImportError
 
-    with pytest.raises(RuntimeError, match=r'pip install "market_watcher\[research\]"'):
+    with pytest.raises(RuntimeError, match=r"yfinance.*pip install -e \."):
         fetch_history(["AAPL"])
 
 
@@ -270,9 +395,16 @@ def test_run_writes_the_target_stocks_and_the_report(tmp_path):
     assert report.read_text().count("\n") == 5  # header + 4 stocks
 
 
-def test_run_refuses_to_write_an_empty_file(tmp_path):
-    with pytest.raises(ValueError, match="No stock passed"):
+def test_run_explains_when_no_prices_came_back(tmp_path):
+    with pytest.raises(ValueError, match="No price history came back for any of the 1 tickers"):
         run(universe="x", output=tmp_path / "out.yaml", load=lambda source: ["T1"], fetch=lambda tickers: {})
+
+
+def test_run_refuses_to_write_an_empty_file(tmp_path):
+    cheap = {"T1": history(0.01, base=1.0)}  # a $1 stock: below the default minimum price
+
+    with pytest.raises(ValueError, match="No stock passed"):
+        run(universe="x", output=tmp_path / "out.yaml", load=lambda source: ["T1"], fetch=lambda tickers: cheap)
 
 
 def test_run_uses_the_module_level_loader_and_fetcher_by_default(monkeypatch, tmp_path):

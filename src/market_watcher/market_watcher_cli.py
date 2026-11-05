@@ -177,7 +177,8 @@ def doctor(stocks, send_test_messages):
     "--universe",
     default="iwv",
     show_default=True,
-    help="'iwv' downloads the iShares Russell 3000 ETF holdings; otherwise a CSV/TXT file with tickers.",
+    help="'iwv' downloads the iShares Russell 3000 ETF holdings, 'nasdaq' the Nasdaq Trader directory of every "
+    "US-listed stock; otherwise a CSV/TXT file with tickers.",
 )
 @click.option("--top", default=50, show_default=True, help="Number of stocks per strategy.")
 @click.option("--min-price", default=5.0, show_default=True, help="Skip stocks whose last close is below this (USD).")
