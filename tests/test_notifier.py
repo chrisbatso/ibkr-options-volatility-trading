@@ -177,3 +177,53 @@ def test_slack_announce_falls_back_to_the_long_straddle_channel(webhook):
     SlackNotifier({**SLACK_CONFIG, "trading url": None}).announce("End of day summary", "Realized P&L: +310 USD")
 
     assert webhook.calls[0][0] == "https://hooks.example/long"
+
+
+# --- SMTP transport --------------------------------------------------------------------------------------------------
+
+
+class FakeStartTLSServer:
+    instances = []
+
+    def __init__(self, hostname, port):
+        self.hostname, self.port = hostname, port
+        self.calls = []
+        FakeStartTLSServer.instances.append(self)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return False
+
+    def starttls(self, context=None):
+        self.calls.append("starttls")
+
+    def login(self, username, password):
+        self.calls.append("login")
+
+    def sendmail(self, sender, recipients, message):
+        self.calls.append("sendmail")
+
+
+def test_port_587_uses_starttls_instead_of_implicit_tls(monkeypatch):
+    FakeStartTLSServer.instances = []
+    monkeypatch.setattr("market_watcher.notifier.smtplib.SMTP", FakeStartTLSServer)
+
+    def no_ssl(*args, **kwargs):
+        raise AssertionError("SMTP_SSL must not be used on port 587")
+
+    monkeypatch.setattr("market_watcher.notifier.smtplib.SMTP_SSL", no_ssl)
+
+    EmailNotifier({**EMAIL_CONFIG, "port": "587"}).announce("Doctor", "STARTTLS works")
+
+    [server] = FakeStartTLSServer.instances
+    assert (server.hostname, server.port) == ("smtp.example.com", 587)
+    assert server.calls == ["starttls", "login", "sendmail"]
+
+
+def test_port_465_keeps_implicit_tls(smtp):
+    EmailNotifier(EMAIL_CONFIG).announce("Doctor", "implicit TLS works")
+
+    [server] = smtp.instances
+    assert server.port == 465 and server.logins == [("user", "secret")]

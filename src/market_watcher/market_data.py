@@ -76,6 +76,7 @@ class YFinanceProvider(MarketDataProvider):
 
     def __init__(self, download=None):
         self._download = download
+        quiet_yfinance_logging()
 
     def get_daily_pnls(self, tickers):
         tickers = list(tickers)
@@ -100,6 +101,11 @@ class YFinanceProvider(MarketDataProvider):
                 "or every ticker unknown"
             )
         return result
+
+
+def quiet_yfinance_logging():
+    """Silences yfinance's own ERROR lines (one per delisted ticker, every download); we warn once per ticker."""
+    logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 
 
 def _closes(data, ticker):

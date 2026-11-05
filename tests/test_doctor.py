@@ -188,7 +188,7 @@ def smtp(monkeypatch):
 def test_email_check_logs_in_without_sending_by_default(configured, smtp):
     configured.setitem(context.config, "EMAIL_NOTIFIER_ENABLED", "true")
 
-    check = check_email(smtp_factory=FakeSMTP)
+    check = check_email(connect=FakeSMTP)
 
     assert check.status == OK and check.detail.startswith("SMTP login to smtp.example.com:465 works")
     [server] = smtp.instances
@@ -198,7 +198,7 @@ def test_email_check_logs_in_without_sending_by_default(configured, smtp):
 def test_email_check_can_send_a_test_email(configured, smtp):
     configured.setitem(context.config, "EMAIL_NOTIFIER_ENABLED", "true")
 
-    check = check_email(send_test_message=True, smtp_factory=FakeSMTP)
+    check = check_email(send_test_message=True, connect=FakeSMTP)
 
     assert check.status == OK and check.detail == "test email sent to alice@example.com"
     [server] = smtp.instances
@@ -209,7 +209,7 @@ def test_email_check_fails_on_bad_credentials(configured, smtp):
     configured.setitem(context.config, "EMAIL_NOTIFIER_ENABLED", "true")
     smtp.fail_login = True
 
-    check = check_email(smtp_factory=FakeSMTP)
+    check = check_email(connect=FakeSMTP)
 
     assert check.status == FAIL and "535 authentication failed" in check.detail
 
@@ -357,3 +357,25 @@ def test_run_checks_falls_back_to_aapl_when_the_stocks_file_is_broken(configured
 
     assert checks["target stocks"].status == FAIL
     assert checks["market data"].detail == "constant: AAPL +3.00%"
+
+
+def test_settings_check_shows_the_resolved_provider_behind_an_alias(configured):
+    configured.setitem(context.config, "MARKET_DATA_PROVIDER", "yahoo")
+
+    assert "provider yahoo (yfinance)" in check_settings().detail
+
+
+def test_email_check_hints_at_the_tls_mode_on_a_disconnect(configured):
+    configured.setitem(context.config, "EMAIL_NOTIFIER_ENABLED", "true")
+
+    class Disconnecting:
+        def __init__(self, hostname, port):
+            raise ConnectionError("Connection unexpectedly closed")
+
+    check = check_email(connect=Disconnecting)
+
+    assert check.status == FAIL
+    assert (
+        "Connection unexpectedly closed" in check.detail
+        and "465 means implicit TLS, 587 means STARTTLS" in check.detail
+    )

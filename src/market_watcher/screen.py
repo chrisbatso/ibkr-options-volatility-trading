@@ -29,6 +29,7 @@ from pathlib import Path
 import yaml
 
 from market_watcher.common import STRATEGIES
+from market_watcher.market_data import quiet_yfinance_logging
 from market_watcher.version import VERSION
 
 logger = logging.getLogger(__name__)
@@ -235,6 +236,7 @@ def fetch_history(tickers, period="3mo", batch_size=200):
     except ImportError:
         raise RuntimeError('Screening needs the yfinance package: pip install "market_watcher[research]"') from None
 
+    quiet_yfinance_logging()
     tickers = list(tickers)
     histories = {}
     for start in range(0, len(tickers), batch_size):

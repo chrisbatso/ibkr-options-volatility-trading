@@ -6,8 +6,6 @@ the caller asks for test messages, and the TWS connection is read-only.
 """
 
 import importlib.metadata
-import smtplib
-import ssl
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -22,7 +20,7 @@ from market_watcher.common import (
 from market_watcher.config import config_flag, context
 from market_watcher.market_data import DEFAULT_PROVIDER, PROVIDERS, create_provider
 from market_watcher.market_hours import USMarketHours, parse_closures
-from market_watcher.notifier import EmailNotifier, SlackNotifier
+from market_watcher.notifier import EmailNotifier, SlackNotifier, smtp_connection
 from market_watcher.trading import PAPER_ACCOUNT_PREFIX, TradingSettings, select_chain
 
 OK = "ok"
@@ -69,8 +67,10 @@ def check_settings():
             config_flag(key, default=True)
     except ValueError as e:
         return Check("settings", FAIL, str(e))
+    resolved = PROVIDERS[provider].name
+    shown_provider = provider if provider == resolved else f"{provider} ({resolved})"
     detail = (
-        f"provider {provider}; poll every {update_timeout}s; long straddle > {thresholds['LONG_THRESHOLD']:.2%}, "
+        f"provider {shown_provider}; poll every {update_timeout}s; long straddle > {thresholds['LONG_THRESHOLD']:.2%}, "
         f"short straddle < {thresholds['SHORT_THRESHOLD']:.2%}; "
         f"{'NYSE sessions only' if gated else 'around the clock'}; "
         f"trading {'ENABLED' if trading.enabled else 'disabled'}"
@@ -130,7 +130,7 @@ def check_market_data(tickers):
     return Check("market data", OK, f"{provider.name}: {shown}")
 
 
-def check_email(send_test_message=False, smtp_factory=smtplib.SMTP_SSL):
+def check_email(send_test_message=False, connect=smtp_connection):
     if not config_flag("EMAIL_NOTIFIER_ENABLED", default=True):
         return Check("email", OK, "disabled")
     try:
@@ -139,12 +139,16 @@ def check_email(send_test_message=False, smtp_factory=smtplib.SMTP_SSL):
         if send_test_message:
             notifier.announce("Doctor", "MarketWatcher doctor: email notifications work.")
             return Check("email", OK, f"test email sent to {config['recipients']}")
-        with smtp_factory(config["hostname"], int(config["port"]), context=ssl.create_default_context()) as server:
+        with connect(config["hostname"], int(config["port"])) as server:
             if config["username"]:
                 server.login(config["username"], config["password"])
             server.noop()
     except Exception as e:
-        return Check("email", FAIL, _error(e))
+        return Check(
+            "email",
+            FAIL,
+            f"{_error(e)} - SMTP_PORT 465 means implicit TLS, 587 means STARTTLS; check host, port and credentials",
+        )
     return Check(
         "email",
         OK,

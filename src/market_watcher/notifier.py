@@ -1,6 +1,7 @@
 import logging
 import smtplib
 import ssl
+from contextlib import contextmanager
 from datetime import datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -10,6 +11,21 @@ from slack_sdk.webhook import WebhookClient
 from market_watcher.common import STRATEGIES
 
 logger = logging.getLogger(__name__)
+
+IMPLICIT_TLS_PORT = 465
+
+
+@contextmanager
+def smtp_connection(hostname, port):
+    """An SMTP session ready for login: implicit TLS on port 465, STARTTLS on any other port (587, 25)."""
+    tls = ssl.create_default_context()
+    if int(port) == IMPLICIT_TLS_PORT:
+        with smtplib.SMTP_SSL(hostname, int(port), context=tls) as server:
+            yield server
+    else:
+        with smtplib.SMTP(hostname, int(port)) as server:
+            server.starttls(context=tls)
+            yield server
 
 
 class NotificationError(RuntimeError):
@@ -93,8 +109,7 @@ class EmailNotifier(Notifier):
         self.send(message.as_string())
 
     def send(self, message):
-        ssl_context = ssl.create_default_context()
-        with smtplib.SMTP_SSL(self._hostname, self._port, context=ssl_context) as server:
+        with smtp_connection(self._hostname, self._port) as server:
             if self._username:
                 server.login(self._username, self._password)
             server.sendmail(self._sender, self._recipients, message)

@@ -70,7 +70,7 @@ market_watcher_cli test-slack
 market_watcher_cli screen
 ```
 
-Run `market_watcher_cli doctor` first: it parses every setting, loads the target stocks, reports whether the market is open, fetches a few quotes through the configured provider, logs in to the SMTP server, and - with `TRADING_ENABLED=true` - connects to TWS read-only to check the account type and look up an option chain. `--send-test-messages` also posts to Slack and sends a test email. `market_watcher_cli config` prints the whole effective configuration with secrets masked. Set `LOG_FILE` to keep a rotating log for unattended runs.
+Run `market_watcher_cli doctor` first: it parses every setting, loads the target stocks, reports whether the market is open, fetches a few quotes through the configured provider, logs in to the SMTP server, and - with `TRADING_ENABLED=true` - connects to TWS read-only to check the account type and look up an option chain. `--send-test-messages` also posts to Slack and sends a test email. `market_watcher_cli config` prints the whole effective configuration with secrets masked. Email uses implicit TLS on `SMTP_PORT=465` and STARTTLS on any other port (587). Set `LOG_FILE` to keep a rotating log for unattended runs.
 
 Example CLI output upon starting MarketWatcher engine:
 
