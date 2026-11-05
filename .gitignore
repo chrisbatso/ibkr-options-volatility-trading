@@ -24,6 +24,9 @@ log.*
 # PyCharm files
 .idea
 
+# The trader's record of a run
+trading_journal*.csv
+
 # Pytest / ruff caches
 .pytest_cache
 .ruff_cache

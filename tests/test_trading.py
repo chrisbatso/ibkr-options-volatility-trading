@@ -1,3 +1,4 @@
+import csv
 import math
 import sys
 from dataclasses import dataclass
@@ -196,7 +197,7 @@ def fake_ib():
 
 
 def make_trader(**overrides):
-    settings = TradingSettings(**{"enabled": True, **overrides})
+    settings = TradingSettings(**{"enabled": True, "max_spread_pct": 0.0, **overrides})
     return IBKRStraddleTrader(settings, ib_factory=FakeIB, today=lambda: TODAY)
 
 
@@ -313,7 +314,8 @@ def test_max_open_positions_blocks_new_entries(fake_ib):
 
 def test_the_daily_memory_resets_on_a_new_day(fake_ib):
     days = iter([TODAY, TODAY, TODAY + timedelta(days=1)])
-    trader = IBKRStraddleTrader(TradingSettings(enabled=True), ib_factory=FakeIB, today=lambda: next(days))
+    settings = TradingSettings(enabled=True, max_spread_pct=0.0)
+    trader = IBKRStraddleTrader(settings, ib_factory=FakeIB, today=lambda: next(days))
 
     assert trader.place_straddle("AAPL", LONG) is not None
     assert trader.place_straddle("AAPL", LONG) is None
@@ -715,6 +717,8 @@ TRADING_KEYS = (
     "TRADING_MAX_OPEN_POSITIONS",
     "TRADING_MAX_DAILY_LOSS",
     "STRADDLE_RISK_PER_TRADE",
+    "STRADDLE_MAX_SPREAD_PCT",
+    "TRADING_JOURNAL",
     "IBKR_HOST",
     "IBKR_PORT",
     "IBKR_TRADING_CLIENT_ID",
@@ -739,8 +743,10 @@ def test_settings_are_cautious_by_default(monkeypatch):
         500.0,
         0.0,
     )
+    assert (settings.max_spread_pct, settings.journal_path) == (6.0, "")
     description = settings.describe()
     assert "staged in TWS" in description and "paper accounts only" in description
+    assert "max spread 6% of mid" in description
     assert (
         "take profit 50%" in description and "stop loss 50%" in description and "15 min before the close" in description
     )
@@ -766,6 +772,8 @@ def test_settings_are_read_from_the_configuration(monkeypatch):
         "TRADING_MAX_OPEN_POSITIONS": "4",
         "TRADING_MAX_DAILY_LOSS": "750",
         "STRADDLE_RISK_PER_TRADE": "1200",
+        "STRADDLE_MAX_SPREAD_PCT": "8.5",
+        "TRADING_JOURNAL": "journal.csv",
         "IBKR_HOST": "gateway",
         "IBKR_PORT": "4002",
         "IBKR_TRADING_CLIENT_ID": "9",
@@ -796,6 +804,8 @@ def test_settings_are_read_from_the_configuration(monkeypatch):
         max_open_positions=4,
         max_daily_loss=750.0,
         risk_per_trade=1200.0,
+        max_spread_pct=8.5,
+        journal_path="journal.csv",
         host="gateway",
         port=4002,
         client_id=9,
@@ -833,7 +843,7 @@ class FailingAnnouncer:
 
 
 def announcing_trader(announcer, **overrides):
-    settings = TradingSettings(**{"enabled": True, **overrides})
+    settings = TradingSettings(**{"enabled": True, "max_spread_pct": 0.0, **overrides})
     return IBKRStraddleTrader(
         settings, ib_factory=FakeIB, today=lambda: TODAY, announcers=[FailingAnnouncer(), announcer]
     )
@@ -1672,7 +1682,7 @@ class WiredIB(IB):
 
 def wired_trader(**overrides):
     WiredIB.instances = []
-    settings = TradingSettings(**{"enabled": True, "transmit": True, **overrides})
+    settings = TradingSettings(**{"enabled": True, "transmit": True, "max_spread_pct": 0.0, **overrides})
     return IBKRStraddleTrader(settings, ib_factory=WiredIB, today=lambda: TODAY)
 
 
@@ -1750,3 +1760,146 @@ def test_ib_async_rejected_entry_is_forgotten_and_a_rejected_exit_retried(fake_i
     trader.manage_positions(NOW, SESSION)
 
     assert trader.positions["MSFT"].exit_order_id == 4  # a new order: ib_async refuses to modify a finished one
+
+
+# --- The spread guard -------------------------------------------------------------------------------------------------
+
+
+def test_straddle_wider_than_the_spread_limit_is_refused_without_using_a_slot(fake_ib):
+    trader = make_trader(
+        max_spread_pct=6.0, max_orders_per_day=1
+    )  # the default quotes: bid 5.80, ask 6.20, 6.67% of mid
+
+    trader.notify({LONG: {"AAPL": 0.05}})
+
+    assert fake_ib.instances[0].orders == []
+    assert trader.positions == {}
+
+    quote_atm(3.05, 3.15, 2.85, 2.95)  # now 3.3% of mid: the slot was not used up
+    trader.notify({LONG: {"AAPL": 0.05}})
+
+    assert len(fake_ib.instances[0].orders) == 1
+
+
+def test_spread_limit_applies_to_short_straddles_too(fake_ib):
+    trader = make_trader(strategies=frozenset({SHORT}), max_spread_pct=6.0)
+
+    with pytest.raises(ValueError, match="exceeds STRADDLE_MAX_SPREAD_PCT 6"):
+        trader.place_straddle("AAPL", SHORT)
+
+
+def test_an_unmeasurable_spread_is_refused_unless_the_limit_is_off(fake_ib):
+    FakeIB.quotes[("C", 100.0)] = Snapshot(last=3.1)  # no bid or ask on the call
+
+    with pytest.raises(ValueError, match="no two-sided quote"):
+        make_trader(max_spread_pct=6.0).place_straddle("AAPL", LONG)
+
+    assert make_trader(max_spread_pct=0.0).place_straddle("AAPL", LONG) is not None
+
+
+def test_a_refusal_is_one_warning_not_a_traceback(fake_ib, caplog):
+    trader = make_trader(max_spread_pct=6.0)
+
+    with caplog.at_level("WARNING", logger="market_watcher.trading"):
+        trader.notify({LONG: {"AAPL": 0.05}})
+
+    [record] = caplog.records
+    assert record.levelname == "WARNING" and "spread 6.7% of mid" in record.getMessage()
+    assert record.exc_info is None
+
+
+# --- The trade journal ------------------------------------------------------------------------------------------------
+
+
+def read_journal(path):
+    with open(path, newline="") as f:
+        return list(csv.DictReader(f))
+
+
+def test_journal_records_a_trade_from_order_to_close_with_its_quotes(fake_ib, tmp_path):
+    path = tmp_path / "journal.csv"
+    trader, ib = open_long(journal_path=str(path))
+    ib.trade_objects[0].fill(6.05)
+    trader.manage_positions(NOW, SESSION)
+    quote_atm(1.4, 1.5, 1.4, 1.5)
+    trader.manage_positions(NOW, SESSION)  # stop-loss exit
+    quote_atm(0.5, 0.6, 0.5, 0.6)
+    trader.manage_positions(NOW, SESSION)  # the exit follows the market
+    ib.trade_objects[1].fill(1.0)
+    trader.manage_positions(NOW, SESSION)
+
+    rows = read_journal(path)
+
+    assert [row["event"] for row in rows] == ["order placed", "entry filled", "exit placed", "exit moved", "closed"]
+    placed, filled, exited, moved, closed = rows
+    assert (placed["ticker"], placed["action"], placed["quantity"], placed["expiry"]) == (
+        "AAPL",
+        "BUY",
+        "1",
+        "20261120",
+    )
+    assert (float(placed["bid"]), float(placed["ask"]), float(placed["mid"])) == pytest.approx((5.8, 6.2, 6.0))
+    assert float(placed["limit"]) == pytest.approx(6.12) and placed["order_id"] == "1"
+    assert float(filled["fill"]) == pytest.approx(6.05)  # fill against the mid is what the backtest could not measure
+    assert exited["reason"].startswith("stop loss") and float(exited["limit"]) == pytest.approx(2.8)
+    assert float(moved["limit"]) == pytest.approx(1.0) and float(moved["bid"]) == pytest.approx(1.0)
+    assert float(closed["fill"]) == pytest.approx(1.0)
+    assert float(closed["pnl_usd"]) == pytest.approx((1.0 - 6.05) * 100)
+    assert placed["dry_run"] == "False"
+    assert placed["time"].endswith("+00:00")
+
+
+def test_journal_records_rejections_cancellations_and_partial_closes(fake_ib, tmp_path):
+    path = tmp_path / "journal.csv"
+    rejected, ib = open_long(journal_path=str(path))
+    ib.trade_objects[0].reject()
+    rejected.manage_positions(NOW, SESSION)
+    cancelled, ib = open_long(journal_path=str(path))
+    ib.trade_objects[0].cancel()
+    cancelled.manage_positions(NOW, SESSION)
+    partial, ib = open_long(journal_path=str(path), contracts=3, max_premium=100_000)
+    ib.trade_objects[0].fill(6.0)
+    quote_atm(5.0, 5.2, 4.0, 4.2)
+    partial.manage_positions(NOW, SESSION)
+    ib.trade_objects[1].partial_fill(1, 9.1)
+    ib.trade_objects[1].cancel()
+    partial.manage_positions(NOW, SESSION)
+
+    rows = read_journal(path)
+    events = [row["event"] for row in rows]
+
+    assert "entry rejected" in events and "entry cancelled" in events
+    assert "partly closed" in events and "exit cancelled" in events
+    closed = next(row for row in rows if row["event"] == "partly closed")
+    assert closed["quantity"] == "1" and float(closed["pnl_usd"]) == pytest.approx((9.1 - 6.0) * 100)
+
+
+def test_journal_labels_dry_runs(fake_ib, tmp_path):
+    path = tmp_path / "journal.csv"
+    trader = make_trader(dry_run=True, journal_path=str(path))
+    trader.place_straddle("AAPL", LONG)
+    quote_atm(5.0, 5.2, 4.0, 4.2)
+    trader.manage_positions(NOW, SESSION)
+
+    rows = read_journal(path)
+
+    assert [row["event"] for row in rows] == ["order placed", "closed"]
+    assert {row["dry_run"] for row in rows} == {"True"}
+    assert rows[0]["order_id"] == ""
+
+
+def test_a_journal_that_cannot_be_written_never_affects_trading(fake_ib, tmp_path, caplog):
+    trader = make_trader(journal_path=str(tmp_path))  # a directory, so every write fails
+
+    assert trader.place_straddle("AAPL", LONG) is not None
+
+    assert len(fake_ib.instances[0].orders) == 1
+    assert "Could not write to the trade journal" in caplog.text
+
+
+def test_no_journal_is_written_unless_one_is_configured(fake_ib, tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+
+    make_trader().place_straddle("AAPL", LONG)
+
+    assert list(tmp_path.iterdir()) == []

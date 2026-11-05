@@ -37,7 +37,11 @@ state, then extended with the Interactive Brokers integration it always promised
   notifiers (`SLACK_TRADING_WEBHOOK` optionally routes them to their own channel).
 - Optional rotating log file (`LOG_FILE`); `config` prints the whole effective
   configuration with secrets masked.
-- CI builds the Docker image; tests grew from 1 to over 330.
+- A backtest of the frozen rules on real option quotes, with its method and limits, in
+  `research/backtest/`. Result: buying these straddles loses money.
+- `STRADDLE_MAX_SPREAD_PCT` refuses straddles with wide spreads (default 6% of mid), and
+  `TRADING_JOURNAL` records every order, fill and close with its quotes as CSV.
+- CI builds the Docker image; tests grew from 1 to over 340.
 
 ### Changed
 - Packaging moved to `pyproject.toml`; Python 3.10+ required; `ruff` replaces

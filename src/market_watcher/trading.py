@@ -36,6 +36,7 @@ from datetime import date, datetime, timedelta
 
 from market_watcher.common import STRATEGIES, VALID_STRATEGIES
 from market_watcher.config import config_flag, config_float, config_int, context
+from market_watcher.journal import TradeJournal
 from market_watcher.market_data import current_price, valid_price
 
 logger = logging.getLogger(__name__)
@@ -88,6 +89,10 @@ class TradingSettings:
     max_open_positions: int = 3
     max_daily_loss: float = 500.0  # USD of realized + unrealized loss that closes everything for the day (0 disables)
     risk_per_trade: float = 0.0  # USD: size long straddles by premium at risk (0 = always `contracts`)
+    max_spread_pct: float = (
+        6.0  # refuse a straddle whose bid-ask spread is wider than this share of its mid (0 disables)
+    )
+    journal_path: str = ""  # CSV of every order, fill and close ("" = no journal)
     host: str = "127.0.0.1"
     port: int = 7497
     client_id: int = 2
@@ -115,6 +120,8 @@ class TradingSettings:
             max_open_positions=config_int("TRADING_MAX_OPEN_POSITIONS", default=3),
             max_daily_loss=config_float("TRADING_MAX_DAILY_LOSS", default=500.0),
             risk_per_trade=config_float("STRADDLE_RISK_PER_TRADE", default=0.0),
+            max_spread_pct=config_float("STRADDLE_MAX_SPREAD_PCT", default=6.0),
+            journal_path=context.config.get("TRADING_JOURNAL") or "",
             host=context.config.get("IBKR_HOST") or "127.0.0.1",
             port=config_int("IBKR_PORT", default=7497),
             client_id=config_int("IBKR_TRADING_CLIENT_ID", default=2),
@@ -144,6 +151,7 @@ class TradingSettings:
         return (
             f"{mode}; {account}; {', '.join(sorted(self.strategies))}; {self.contracts} contract(s) per order{sizing}; "
             f"max premium {self.max_premium:,.0f} USD, max notional {self.max_notional:,.0f} USD; "
+            f"{f'max spread {self.max_spread_pct:g}% of mid' if self.max_spread_pct > 0 else 'no spread limit'}; "
             f"max {self.max_orders_per_day} order(s) per day, {self.max_open_positions} open; "
             f"daily loss limit {self.max_daily_loss:,.0f} USD; {take_profit}, {stop_loss}, {close}; "
             f"expiry >= {self.min_days_to_expiry} days"
@@ -168,6 +176,8 @@ class StraddleSpec:
     contract: object  # the ib_async Bag contract
     call: object = None  # the qualified ib_async Option legs
     put: object = None
+    bid: float | None = None  # the straddle's quote when it was priced, when both legs quote that side
+    ask: float | None = None
 
     @property
     def premium(self):
@@ -287,6 +297,21 @@ def check_limits(spec, settings):
         raise ValueError(
             f"notional {spec.notional:,.0f} USD exceeds STRADDLE_MAX_NOTIONAL {settings.max_notional:,.0f}"
         )
+
+
+def check_spread(spec, settings):
+    """Raises ValueError when the straddle's bid-ask spread is too wide to be worth trading, or cannot be measured.
+
+    Crossing the spread is what decides this strategy's result (research/backtest/RESULTS.md), so an unknown spread is
+    not given the benefit of the doubt.
+    """
+    if settings.max_spread_pct <= 0:
+        return
+    if spec.bid is None or spec.ask is None:
+        raise ValueError("the straddle has no two-sided quote, so its spread cannot be checked")
+    spread = (spec.ask - spec.bid) / ((spec.ask + spec.bid) / 2) * 100
+    if spread > settings.max_spread_pct:
+        raise ValueError(f"spread {spread:.1f}% of mid exceeds STRADDLE_MAX_SPREAD_PCT {settings.max_spread_pct:g}")
 
 
 def unrealized_pnl(position, value):
@@ -420,6 +445,7 @@ class IBKRStraddleTrader:
         self._realized = []  # (day, ticker, USD)
         self._needs_sync = False  # set by _connect() on every new connection: reconcile the book with IB first
         self._summarized_on = None
+        self._journal = TradeJournal(settings.journal_path, settings.dry_run) if settings.journal_path else None
 
     # Notifier interface ---------------------------------------------------------------------------------------------
 
@@ -430,6 +456,8 @@ class IBKRStraddleTrader:
             for ticker in opportunities:
                 try:
                     self.place_straddle(ticker, strategy)
+                except ValueError as e:  # a rule said no (caps, spread, no quote): routine, and it uses no slot
+                    logger.warning("Not placing a %s on %s: %s", strategy, ticker, e)
                 except Exception:
                     logger.exception("Could not place a %s on %s", strategy, ticker)
 
@@ -448,6 +476,14 @@ class IBKRStraddleTrader:
                 announcer.announce(subject, text)
             except Exception:
                 logger.exception("Announcer %s failed", type(announcer).__name__)
+
+    def _record(self, event, spec, quote=None, **fields):
+        """Adds a row to the journal, if there is one, with the quote that applied when ``quote`` is given."""
+        if self._journal is None:
+            return
+        if quote is not None:
+            fields = {"bid": quote.bid, "ask": quote.ask, "mid": quote.mid, **fields}
+        self._journal.record(event, spec, **fields)
 
     def day_summary(self, today):
         """One paragraph on the day: closed trades with their P&L and what is still open."""
@@ -498,10 +534,13 @@ class IBKRStraddleTrader:
 
         spec = self.build_straddle(ib, ticker, strategy, today)
         check_limits(spec, settings)
+        check_spread(spec, settings)
+        entry_quote = StraddleQuote(mid=spec.call_price + spec.put_price, bid=spec.bid, ask=spec.ask)
 
         if settings.dry_run:
             logger.info("DRY RUN - would place %s", spec.describe())
             self._announce("Straddle order", f"Would place {spec.describe()}")
+            self._record("order placed", spec, entry_quote, limit=spec.limit_price)
             position = OpenStraddle(spec, spec.call, spec.put, None, spec.limit_price, True, today)
         else:
             trade = ib.placeOrder(spec.contract, self._order(spec.action, spec.quantity, spec.limit_price, ORDER_REF))
@@ -515,6 +554,7 @@ class IBKRStraddleTrader:
             )
             position = OpenStraddle(spec, spec.call, spec.put, trade.order.orderId, spec.limit_price, False, today)
             self._announce("Straddle order placed", f"{spec.describe()}\nOrder id {trade.order.orderId}: {placement}")
+            self._record("order placed", spec, entry_quote, limit=spec.limit_price, order_id=trade.order.orderId)
         self.positions[ticker] = position
         self._placed_today.add(ticker)
         return spec
@@ -544,6 +584,7 @@ class IBKRStraddleTrader:
         action = "BUY" if strategy == LONG else "SELL"
         multiplier = int(chain.multiplier or 100)
         limit = limit_price(call_price + put_price, action, self.settings.limit_buffer_pct)
+        quote = straddle_quote(call_snapshot, put_snapshot)
         return StraddleSpec(
             ticker=ticker,
             strategy=strategy,
@@ -559,6 +600,8 @@ class IBKRStraddleTrader:
             contract=self._combo(ticker, call.conId, put.conId, Bag, ComboLeg),
             call=call,
             put=put,
+            bid=quote.bid,
+            ask=quote.ask,
         )
 
     def _quantity(self, limit, multiplier, action):
@@ -719,6 +762,7 @@ class IBKRStraddleTrader:
         elif status == REJECTED:
             logger.error("Entry order %s for %s was rejected by IB; forgetting it", trade.order.orderId, ticker)
             del self.positions[ticker]
+            self._record("entry rejected", position.spec, order_id=trade.order.orderId)
             self._announce(
                 "Straddle entry rejected",
                 f"{position.spec.describe()}\nOrder id {trade.order.orderId} was rejected by IB; see TWS for why",
@@ -726,6 +770,7 @@ class IBKRStraddleTrader:
         elif status in DEAD_ORDER_STATUSES:
             logger.warning("Entry order %s for %s was cancelled; forgetting it", trade.order.orderId, ticker)
             del self.positions[ticker]
+            self._record("entry cancelled", position.spec, order_id=trade.order.orderId)
         elif filled and not position.cancel_requested:
             # A limit order still part-filled at the next poll has gone stale: stop it and manage what it bought,
             # rather than leave open risk outside the stops until the order completes.
@@ -739,6 +784,7 @@ class IBKRStraddleTrader:
         if contracts < ordered:
             position.spec = replace(position.spec, quantity=contracts)
             note = f" ({contracts} of {ordered} contracts; the rest was cancelled)"
+        self._record("entry filled", position.spec, fill=position.entry_price, order_id=position.entry_order_id)
         self._announce(
             "Straddle entry filled", f"{position.spec.describe()}\nFilled at {position.entry_price:.2f}{note}"
         )
@@ -753,6 +799,13 @@ class IBKRStraddleTrader:
             self._book_partial_exit(position, filled, trade.orderStatus.avgFillPrice or position.exit_price, today)
             if ticker not in self.positions:
                 return
+        self._record(
+            "exit rejected" if trade.orderStatus.status == REJECTED else "exit cancelled",
+            position.spec,
+            limit=position.exit_price,
+            reason=position.exit_reason,
+            order_id=order_id,
+        )
         if trade.orderStatus.status == REJECTED:
             logger.error("Exit order %s for %s was rejected by IB; it will be placed again", order_id, ticker)
             if not position.exit_rejection_announced:
@@ -775,6 +828,7 @@ class IBKRStraddleTrader:
         pnl = unrealized_pnl(position, price) * contracts / position.spec.quantity
         self._realized.append((today, ticker, pnl))
         position.spec = replace(position.spec, quantity=position.spec.quantity - contracts)
+        self._record("partly closed", replace(position.spec, quantity=contracts), fill=price, pnl_usd=round(pnl, 2))
         self._announce(
             "Straddle partly closed",
             f"{ticker}: {contracts} contract(s) closed at {price:.2f}: {pnl:+,.0f} USD; "
@@ -816,6 +870,14 @@ class IBKRStraddleTrader:
             position.exit_reason,
         )
         position.exit_price = limit
+        self._record(
+            "exit moved",
+            position.spec,
+            quote,
+            limit=limit,
+            reason=position.exit_reason,
+            order_id=position.exit_order_id,
+        )
         if escalated:
             self._announce(
                 "Closing straddle",
@@ -836,12 +898,14 @@ class IBKRStraddleTrader:
             del self.positions[ticker]
             logger.info("DRY RUN - would close the %s straddle at %.2f (%s): %+.0f USD", ticker, limit, reason, pnl)
             self._announce("Straddle closed", f"Would close {ticker} at {limit:.2f} ({reason}): {pnl:+,.0f} USD")
+            self._record("closed", position.spec, quote, limit=limit, fill=limit, pnl_usd=round(pnl, 2), reason=reason)
             return
         reference = HALT_EXIT_REF if reason == DAILY_LOSS_REASON else EXIT_REF
         trade = ib.placeOrder(position.spec.contract, self._order(action, position.spec.quantity, limit, reference))
         position.exit_order_id = trade.order.orderId
         position.exit_price = limit
         position.exit_reason = reason
+        self._record("exit placed", position.spec, quote, limit=limit, reason=reason, order_id=trade.order.orderId)
         logger.info(
             "Closing the %s straddle: %s %d at %.2f (%s) - order id %s, %s",
             ticker,
@@ -863,6 +927,7 @@ class IBKRStraddleTrader:
         pnl = unrealized_pnl(position, price)
         self._realized.append((today, ticker, pnl))
         self.positions.pop(ticker, None)
+        self._record("closed", position.spec, fill=price, pnl_usd=round(pnl, 2), reason=how)
         self._announce(
             "Straddle closed",
             f"{ticker} closed at {price:.2f} ({how}): {pnl:+,.0f} USD; "
