@@ -5,12 +5,13 @@ from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
-from ib_async import Option, OptionChain
+from ib_async import IB, Bag, ComboLeg, LimitOrder, Option, OptionChain
 
 from market_watcher.config import context
 from market_watcher.market_hours import Session
 from market_watcher.trading import (
     EXIT_REF,
+    HALT_EXIT_REF,
     LONG,
     ORDER_REF,
     SHORT,
@@ -47,17 +48,27 @@ class Snapshot:
 
 
 class FakeTrade:
-    def __init__(self, order, order_id, status="PendingSubmit"):
+    def __init__(self, order, order_id, status="PendingSubmit", contract=None):
         order.orderId = order_id
         self.order = order
-        self.orderStatus = SimpleNamespace(status=status, avgFillPrice=0.0)
+        self.contract = contract
+        self.orderStatus = SimpleNamespace(status=status, avgFillPrice=0.0, filled=0.0)
 
     def fill(self, price):
         self.orderStatus.status = "Filled"
         self.orderStatus.avgFillPrice = price
+        self.orderStatus.filled = self.order.totalQuantity
+
+    def partial_fill(self, contracts, price):
+        self.orderStatus.status = "Submitted"  # IB reports a partly filled order as still working
+        self.orderStatus.avgFillPrice = price
+        self.orderStatus.filled = contracts
 
     def cancel(self):
         self.orderStatus.status = "Cancelled"
+
+    def reject(self):
+        self.orderStatus.status = "Inactive"
 
 
 class FakeIB:
@@ -72,6 +83,8 @@ class FakeIB:
     chains = []
     executions = []
     held = []
+    live_trades = []  # orders an earlier run or connection left at IB: every new connection sees them
+    cancel_status = "Cancelled"  # what a cancel does at once; real IB goes through PendingCancel
 
     def __init__(self):
         self.connected = False
@@ -79,6 +92,7 @@ class FakeIB:
         self.orders = []
         self.trade_objects = []
         self.cancelled = []
+        self.modifications = []
         FakeIB.instances.append(self)
 
     def connect(self, host, port, clientId, timeout, readonly):  # noqa: N803 - ib_async's keyword
@@ -104,6 +118,13 @@ class FakeIB:
                 contract.conId = FakeIB.stocks.get(contract.symbol, 0)
             elif contract.secType == "OPT" and contract.strike in FakeIB.available_strikes:
                 contract.conId = int(contract.strike * 10) + (1 if contract.right == "C" else 2)
+            elif not contract.secType and contract.conId:  # looked up by conId alone: IB fills in the rest
+                contract.secType = "OPT"
+                contract.symbol = "AAPL"
+                contract.lastTradeDateOrContractMonth = "20261120"
+                contract.strike = float(contract.conId // 10)
+                contract.right = "C" if contract.conId % 10 == 1 else "P"
+                contract.multiplier = "100"
         return [contract for contract in contracts if contract.conId]
 
     def reqTickers(self, *contracts):  # noqa: N802
@@ -119,19 +140,22 @@ class FakeIB:
         return list(FakeIB.chains)
 
     def placeOrder(self, contract, order):  # noqa: N802
+        if order.orderId:  # like IB: an order that already has an id is a modification, not a second order
+            self.modifications.append((order.orderId, order.lmtPrice))
+            return next(trade for trade in self.trades() if trade.order.orderId == order.orderId)
         self.orders.append((contract, order))
-        trade = FakeTrade(order, len(self.orders))
+        trade = FakeTrade(order, len(self.orders), contract=contract)
         self.trade_objects.append(trade)
         return trade
 
     def trades(self):
-        return list(self.trade_objects)
+        return list(self.trade_objects) + list(FakeIB.live_trades)
 
     def cancelOrder(self, order):  # noqa: N802
         self.cancelled.append(order.orderId)
-        for trade in self.trade_objects:
+        for trade in self.trades():
             if trade.order.orderId == order.orderId:
-                trade.cancel()
+                trade.orderStatus.status = FakeIB.cancel_status
 
     def positions(self):
         return list(FakeIB.held)
@@ -166,6 +190,8 @@ def fake_ib():
     FakeIB.chains = list(DEFAULT_CHAINS)
     FakeIB.executions = []
     FakeIB.held = []
+    FakeIB.live_trades = []
+    FakeIB.cancel_status = "Cancelled"
     return FakeIB
 
 
@@ -997,3 +1023,730 @@ def test_dry_run_positions_survive_a_reconnect(fake_ib):
     trader.manage_positions(NOW, SESSION)
 
     assert "AAPL" in trader.positions
+
+
+def test_a_pending_entry_is_not_marked_filled_by_fills_of_another_order(fake_ib):
+    trader, ib = open_long()  # entry pending as order 1
+    disconnect(ib)
+    fake_ib.live_trades = list(ib.trade_objects)  # still working at IB
+    fake_ib.held = held_legs(1001, 1002)  # the same legs, held because of a different order
+    fake_ib.executions = todays_entry(order_id=7)
+
+    trader.manage_positions(NOW, SESSION)
+
+    position = trader.positions["AAPL"]
+    assert not position.filled and position.entry_order_id == 1
+
+
+# --- Restarts: what an earlier run left at IB ------------------------------------------------------------------------
+
+
+def todays_entry(call=3.05, put=2.95, order_id=7, shares=1, side="BOT"):
+    return [
+        execution(1001, "C", order_id, call, side=side, shares=shares),
+        execution(1002, "P", order_id, put, side=side, shares=shares),
+    ]
+
+
+def todays_exit(call, put, order_id=8, shares=1, side="SLD", ref=EXIT_REF):
+    return [
+        execution(1001, "C", order_id, call, side=side, shares=shares, ref=ref),
+        execution(1002, "P", order_id, put, side=side, shares=shares, ref=ref),
+    ]
+
+
+def combo_fill(order_id, price, ref=ORDER_REF, side="BOT"):
+    """IB also reports a combo as a whole, alongside the fills of its legs."""
+    contract = Bag(symbol="AAPL", currency="USD", exchange="SMART")
+    contract.conId = 28812380
+    return SimpleNamespace(
+        contract=contract,
+        execution=SimpleNamespace(orderId=order_id, orderRef=ref, side=side, shares=1, price=price),
+    )
+
+
+def live_order(ref, action, limit, order_id=7, quantity=1):
+    """A working combo order, the way a new connection sees it."""
+    contract = Bag(
+        symbol="AAPL",
+        currency="USD",
+        exchange="SMART",
+        comboLegs=[
+            ComboLeg(conId=1001, ratio=1, action="BUY", exchange="SMART"),
+            ComboLeg(conId=1002, ratio=1, action="BUY", exchange="SMART"),
+        ],
+    )
+    order = LimitOrder(action, quantity, limit, orderRef=ref)
+    return FakeTrade(order, order_id, status="Submitted", contract=contract)
+
+
+def test_restart_reconciles_the_book_before_the_first_order(fake_ib):
+    fake_ib.executions = todays_entry()
+    fake_ib.held = held_legs(1001, 1002)
+    trader = make_trader()
+
+    trader.notify({LONG: {"AAPL": 0.03}})  # the engine notifies before it runs the cycle hooks
+
+    [ib] = fake_ib.instances
+    assert ib.orders == []  # IB already holds this straddle
+    position = trader.positions["AAPL"]
+    assert position.filled and position.entry_order_id is None and position.entry_price == pytest.approx(6.0)
+
+
+def test_restart_counts_what_ib_holds_against_the_open_position_limit(fake_ib):
+    fake_ib.executions = todays_entry()
+    fake_ib.held = held_legs(1001, 1002)
+    trader = make_trader(max_open_positions=1)
+
+    assert trader.place_straddle("MSFT", LONG) is None
+    assert fake_ib.instances[0].orders == []
+
+
+def test_restart_recovers_a_working_entry_and_manages_its_fill(fake_ib):
+    trade = live_order(ORDER_REF, "BUY", 6.12)
+    fake_ib.live_trades = [trade]
+    trader = make_trader()
+
+    assert trader.place_straddle("AAPL", LONG) is None
+    assert fake_ib.instances[0].orders == []
+    position = trader.positions["AAPL"]
+    assert not position.filled and position.entry_order_id == 7
+    assert (position.spec.action, position.spec.strike, position.spec.expiry) == ("BUY", 100.0, "20261120")
+    assert (position.call.right, position.put.right) == ("C", "P")
+
+    trade.fill(6.0)
+    quote_atm(5.0, 5.2, 4.0, 4.2)
+    trader.manage_positions(NOW, SESSION)
+
+    assert position.filled and position.entry_price == 6.0
+    assert position.exit_reason.startswith("take profit")  # managed like any other straddle
+
+
+def test_restart_adopts_a_working_exit_instead_of_placing_a_second_one(fake_ib):
+    fake_ib.executions = todays_entry()
+    fake_ib.held = held_legs(1001, 1002)
+    fake_ib.live_trades = [live_order(EXIT_REF, "SELL", 9.0, order_id=8)]
+    trader = make_trader()
+    quote_atm(1.4, 1.5, 1.4, 1.5)  # past the stop loss
+
+    trader.manage_positions(NOW, SESSION)
+
+    [ib] = fake_ib.instances
+    assert ib.orders == []  # a second exit would leave the straddle short once both filled
+    assert trader.positions["AAPL"].exit_order_id == 8
+    assert ib.modifications == [(8, 2.8)]  # the working exit follows the market instead
+    assert fake_ib.live_trades[0].order.transmit is False  # and a staged order stays staged
+
+
+def test_restart_with_a_partly_filled_working_exit_counts_those_contracts_once(fake_ib):
+    fake_ib.executions = todays_entry(shares=3) + todays_exit(3.1, 3.0, shares=1)
+    fake_ib.held = held_legs(1001, 1002)
+    exit_trade = live_order(EXIT_REF, "SELL", 9.0, order_id=8, quantity=3)
+    exit_trade.partial_fill(1, 6.1)
+    fake_ib.live_trades = [exit_trade]
+    trader = make_trader()
+
+    trader.manage_positions(NOW, SESSION)
+
+    position = trader.positions["AAPL"]
+    assert position.spec.quantity == 2 and position.exit_order_id == 8
+    assert trader.realized_today(TODAY) == pytest.approx(10)
+
+    exit_trade.cancel()
+    trader.manage_positions(NOW, SESSION)
+
+    assert position.spec.quantity == 2 and position.exit_order_id is None
+    assert trader.realized_today(TODAY) == pytest.approx(10)
+
+    trader.manage_positions(NEAR_CLOSE, SESSION)
+
+    [(_, new_exit)] = fake_ib.instances[0].orders
+    assert new_exit.totalQuantity == 2
+
+
+def test_a_reconnect_with_a_partly_filled_working_exit_counts_those_contracts_once(fake_ib):
+    trader, ib = open_long(contracts=3, max_premium=100_000)
+    ib.trade_objects[0].fill(6.0)
+    quote_atm(5.0, 5.2, 4.0, 4.2)
+    trader.manage_positions(NOW, SESSION)
+    exit_trade = ib.trade_objects[1]
+    exit_trade.partial_fill(1, 9.1)
+    disconnect(ib)
+    fake_ib.live_trades = [exit_trade]
+    fake_ib.held = held_legs(1001, 1002)
+    fake_ib.executions = todays_entry(order_id=1, shares=3) + todays_exit(5.0, 4.1, order_id=2, shares=1)
+
+    trader.manage_positions(NOW, SESSION)
+
+    assert trader.realized_today(TODAY) == 0  # still one working order: it is booked when it finishes
+    assert trader.positions["AAPL"].spec.quantity == 3
+
+    exit_trade.fill(9.1)
+    trader.manage_positions(NOW, SESSION)
+
+    assert trader.realized_today(TODAY) == pytest.approx((9.1 - 6.0) * 100 * 3)
+
+
+def test_restart_keeps_tickers_already_traded_today_off_limits(fake_ib):
+    fake_ib.executions = todays_entry() + todays_exit(3.1, 3.0)  # opened and closed by an earlier run
+    trader = make_trader()
+
+    assert trader.place_straddle("AAPL", LONG) is None
+    assert fake_ib.instances[0].orders == []
+
+
+def test_restart_restores_the_daily_order_cap(fake_ib):
+    fake_ib.executions = todays_entry() + todays_exit(3.1, 3.0)
+    trader = make_trader(max_orders_per_day=1)
+
+    assert trader.place_straddle("MSFT", LONG) is None
+    assert fake_ib.instances[0].orders == []
+
+
+@pytest.mark.parametrize(
+    ("entry_side", "exit_side", "expected"),
+    [("BOT", "SLD", (6.1 - 6.0) * 100), ("SLD", "BOT", (6.0 - 6.1) * 100)],
+)
+def test_restart_restores_the_realized_pnl_of_both_directions(fake_ib, entry_side, exit_side, expected):
+    fake_ib.executions = todays_entry(side=entry_side) + todays_exit(3.1, 3.0, side=exit_side)
+    trader = make_trader()
+
+    trader.manage_positions(NOW, SESSION)
+
+    assert trader.realized_today(TODAY) == pytest.approx(expected)
+
+
+def test_restart_restores_the_halt_after_a_realized_loss(fake_ib):
+    fake_ib.executions = todays_entry() + todays_exit(1.0, 1.0)  # -400 USD
+    trader = make_trader(max_daily_loss=100)
+
+    assert trader.place_straddle("MSFT", LONG) is None
+    assert fake_ib.instances[0].orders == []
+
+
+def test_restart_restores_a_halt_that_realized_less_than_the_limit(fake_ib):
+    # The limit was hit on unrealized losses, then the exits filled at better prices: only the tag remembers it.
+    fake_ib.executions = todays_entry() + todays_exit(2.9, 2.9, ref=HALT_EXIT_REF)  # -20 USD
+    trader = make_trader(max_daily_loss=500)
+
+    assert trader.place_straddle("MSFT", LONG) is None
+    assert fake_ib.instances[0].orders == []
+
+
+def test_a_restored_halt_closes_what_is_still_open(fake_ib):
+    fake_ib.executions = todays_entry(shares=2) + todays_exit(2.9, 2.9, shares=1, ref=HALT_EXIT_REF)
+    fake_ib.held = held_legs(1001, 1002)
+    trader = make_trader(max_daily_loss=500)
+
+    trader.manage_positions(NOW, SESSION)
+
+    [ib] = fake_ib.instances
+    [(_, exit_order)] = ib.orders
+    assert (exit_order.action, exit_order.totalQuantity, exit_order.orderRef) == ("SELL", 1, HALT_EXIT_REF)
+    assert trader.positions["AAPL"].exit_reason == "daily loss limit"
+
+
+def test_exits_forced_by_the_daily_loss_limit_are_tagged(fake_ib):
+    trader = make_trader(max_daily_loss=100)
+    trader.place_straddle("AAPL", LONG)
+    [ib] = fake_ib.instances
+    ib.trade_objects[0].fill(6.0)
+    quote_atm(2.4, 2.5, 2.4, 2.5)
+
+    trader.manage_positions(NOW, SESSION)
+
+    assert ib.orders[1][1].orderRef == HALT_EXIT_REF
+
+
+def test_a_reconnect_does_not_count_a_close_twice(fake_ib):
+    trader, ib = open_long()
+    ib.trade_objects[0].fill(6.0)
+    quote_atm(5.0, 5.2, 4.0, 4.2)
+    trader.manage_positions(NOW, SESSION)
+    ib.trade_objects[1].fill(9.1)
+    trader.manage_positions(NOW, SESSION)
+    assert trader.realized_today(TODAY) == pytest.approx(310)
+    disconnect(ib)
+    fake_ib.executions = todays_entry(order_id=1) + todays_exit(5.0, 4.1, order_id=2)
+
+    trader.manage_positions(NOW, SESSION)
+
+    assert trader.realized_today(TODAY) == pytest.approx(310)
+
+
+def test_recovery_ignores_the_combo_level_fill_ib_reports_with_the_legs(fake_ib):
+    fake_ib.executions = [combo_fill(7, 6.0), *todays_entry()]
+    fake_ib.held = held_legs(1001, 1002)
+    trader = make_trader()
+
+    trader.manage_positions(NOW, SESSION)
+
+    position = trader.positions["AAPL"]
+    assert position.entry_price == pytest.approx(6.0) and position.spec.quantity == 1
+
+
+def test_realized_pnl_ignores_the_combo_level_fills(fake_ib):
+    fake_ib.executions = [
+        combo_fill(7, 6.0),
+        *todays_entry(),
+        combo_fill(8, 6.1, ref=EXIT_REF, side="SLD"),
+        *todays_exit(3.1, 3.0),
+    ]
+    trader = make_trader()
+
+    trader.manage_positions(NOW, SESSION)
+
+    assert trader.realized_today(TODAY) == pytest.approx(10)
+    assert trader.positions == {}
+
+
+def test_recovered_legs_are_quoted_on_smart_not_on_the_venue_that_filled_them(fake_ib):
+    fills = todays_entry()
+    for fill in fills:
+        fill.contract.exchange = "BOX"
+    fake_ib.executions = fills
+    fake_ib.held = held_legs(1001, 1002)
+    trader = make_trader()
+
+    trader.manage_positions(NOW, SESSION)
+
+    position = trader.positions["AAPL"]
+    assert (position.call.exchange, position.put.exchange) == ("SMART", "SMART")
+
+
+def test_recovery_nets_off_the_contracts_already_closed(fake_ib):
+    fake_ib.executions = todays_entry(shares=3) + todays_exit(3.1, 3.0, shares=1)
+    fake_ib.held = held_legs(1001, 1002)
+    trader = make_trader()
+
+    trader.manage_positions(NOW, SESSION)
+
+    assert trader.positions["AAPL"].spec.quantity == 2
+    assert trader.realized_today(TODAY) == pytest.approx(10)
+
+
+# --- Exits that do not fill ------------------------------------------------------------------------------------------
+
+
+def stopped_out(**overrides):
+    """A long straddle filled at 6.00 with a stop-loss exit resting at the 2.80 bid (order 2)."""
+    trader, ib = open_long(**overrides)
+    ib.trade_objects[0].fill(6.0)
+    quote_atm(1.4, 1.5, 1.4, 1.5)
+    trader.manage_positions(NOW, SESSION)
+    assert trader.positions["AAPL"].exit_price == pytest.approx(2.8)
+    return trader, ib
+
+
+def test_unfilled_stop_loss_follows_the_market_down(fake_ib):
+    trader, ib = stopped_out()
+    quote_atm(0.5, 0.6, 0.5, 0.6)  # straddle bid 1.00
+
+    trader.manage_positions(NOW, SESSION)
+
+    assert len(ib.orders) == 2  # modified in place: there are never two live exits
+    assert ib.modifications == [(2, pytest.approx(1.0))]
+    position = trader.positions["AAPL"]
+    assert position.exit_price == pytest.approx(1.0) and position.exit_reason.startswith("stop loss")
+
+
+def test_stop_loss_keeps_following_the_market_after_the_value_bounces_inside_the_band(fake_ib):
+    trader, ib = stopped_out()
+    quote_atm(1.3, 1.9, 1.3, 1.9)  # mid 3.20 is back above the stop, but the bid 2.60 is below the resting limit
+
+    trader.manage_positions(NOW, SESSION)
+
+    assert ib.modifications == [(2, pytest.approx(2.6))]
+
+
+def test_an_exit_that_finishes_while_quotes_are_fetched_is_not_modified(fake_ib):
+    trader, ib = stopped_out()
+    quote_atm(0.5, 0.6, 0.5, 0.6)
+    request_quotes = ib.reqTickers
+
+    def fill_during_the_request(*contracts):
+        ib.trade_objects[1].fill(2.8)
+        return request_quotes(*contracts)
+
+    ib.reqTickers = fill_during_the_request
+
+    trader.manage_positions(NOW, SESSION)
+
+    assert ib.modifications == []  # ib_async refuses to modify a finished order
+
+    ib.reqTickers = request_quotes
+    trader.manage_positions(NOW, SESSION)
+
+    assert trader.positions == {}
+    assert trader.realized_today(TODAY) == pytest.approx((2.8 - 6.0) * 100)
+
+
+def test_exit_is_not_repriced_when_the_market_moves_its_way(fake_ib):
+    trader, ib = stopped_out()
+    quote_atm(1.5, 1.6, 1.5, 1.6)  # bid 3.00, above the resting 2.80: it will fill as it stands
+
+    trader.manage_positions(NOW, SESSION)
+
+    assert ib.modifications == []
+    assert trader.positions["AAPL"].exit_price == pytest.approx(2.8)
+
+
+def test_short_straddle_exit_follows_the_ask_up(fake_ib):
+    trader = make_trader(strategies=frozenset({SHORT}))
+    trader.place_straddle("AAPL", SHORT)
+    [ib] = fake_ib.instances
+    ib.trade_objects[0].fill(5.9)
+    quote_atm(4.5, 4.7, 4.5, 4.7)  # mid 9.20 is past the stop at 8.85: buy back at the ask, 9.40
+    trader.manage_positions(NOW, SESSION)
+    assert trader.positions["AAPL"].exit_price == pytest.approx(9.4)
+    quote_atm(5.5, 5.7, 5.5, 5.7)  # ask 11.40
+
+    trader.manage_positions(NOW, SESSION)
+
+    assert ib.modifications == [(2, pytest.approx(11.4))]
+
+
+def test_a_position_with_a_resting_exit_still_counts_against_the_daily_loss_limit(fake_ib):
+    announcer = RecordingAnnouncer()
+    trader = announcing_trader(announcer, max_daily_loss=500)
+    trader.place_straddle("AAPL", LONG)
+    [ib] = fake_ib.instances
+    ib.trade_objects[0].fill(6.0)
+    quote_atm(1.4, 1.5, 1.4, 1.5)
+    trader.manage_positions(NOW, SESSION)  # stop-loss exit rests at 2.80; -310 USD is inside the limit
+    quote_atm(0.2, 0.3, 0.2, 0.3)  # mid 0.50: -550 USD
+
+    trader.manage_positions(NOW, SESSION)
+
+    assert "Daily loss limit hit" in [subject for subject, _ in announcer.messages]
+    assert trader.place_straddle("MSFT", LONG) is None
+
+
+def test_a_halted_day_keeps_closing_what_could_not_be_closed_at_first(fake_ib):
+    trader = make_trader(max_daily_loss=100)
+    trader.place_straddle("AAPL", LONG)
+    trader.place_straddle("MSFT", LONG)
+    [ib] = fake_ib.instances
+    ib.trade_objects[0].fill(6.0)
+    ib.trade_objects[1].fill(6.0)
+    quote_atm(2.4, 2.5, 2.4, 2.5)
+    trader.manage_positions(NOW, SESSION)
+    ib.trade_objects[2].cancel()  # the first exit was cancelled by someone or something
+
+    trader.manage_positions(NOW, SESSION)
+
+    assert trader.positions["AAPL"].exit_reason == "daily loss limit"
+    assert trader.positions["AAPL"].exit_order_id == 5  # placed again under the same halt
+
+
+def take_profit_resting():
+    """A long straddle filled at 6.00 with a take-profit exit resting at 9.02 (order 2)."""
+    trader, ib = open_long()
+    ib.trade_objects[0].fill(6.0)
+    quote_atm(5.0, 5.2, 4.0, 4.2)
+    trader.manage_positions(NOW, SESSION)
+    assert trader.positions["AAPL"].exit_price == pytest.approx(9.02)
+    return trader, ib
+
+
+def test_take_profit_waits_for_its_price_when_no_rule_fires(fake_ib):
+    trader, ib = take_profit_resting()
+    quote_atm(3.0, 3.2, 3.0, 3.2)  # mid 6.20: no rule fires
+
+    trader.manage_positions(NOW, SESSION)
+
+    assert ib.modifications == []
+    assert trader.positions["AAPL"].exit_price == pytest.approx(9.02)
+
+
+def test_take_profit_crosses_the_spread_at_the_session_close(fake_ib):
+    trader, ib = take_profit_resting()
+    quote_atm(3.0, 3.2, 3.0, 3.2)  # straddle bid 6.00
+
+    trader.manage_positions(NEAR_CLOSE, SESSION)
+
+    assert len(ib.orders) == 2
+    assert ib.modifications == [(2, pytest.approx(6.0))]
+    assert trader.positions["AAPL"].exit_reason == "session close"
+
+
+def test_take_profit_becomes_a_stop_loss_when_the_market_collapses(fake_ib):
+    announcer = RecordingAnnouncer()
+    trader = announcing_trader(announcer)
+    trader.place_straddle("AAPL", LONG)
+    [ib] = fake_ib.instances
+    ib.trade_objects[0].fill(6.0)
+    quote_atm(5.0, 5.2, 4.0, 4.2)
+    trader.manage_positions(NOW, SESSION)
+    quote_atm(1.4, 1.5, 1.4, 1.5)
+
+    trader.manage_positions(NOW, SESSION)
+
+    assert ib.modifications == [(2, pytest.approx(2.8))]
+    assert trader.positions["AAPL"].exit_reason.startswith("stop loss")
+    assert "Closing straddle" in announcer.messages[-1][0] and "2.80" in announcer.messages[-1][1]
+
+
+def test_straddle_left_over_from_an_earlier_session_is_closed_unless_held_overnight():
+    leftover = position("BUY", 6.0)
+    leftover.opened_on = TODAY - timedelta(days=1)
+
+    assert exit_reason(leftover, 6.0, NOW, SESSION, TradingSettings()) == "left open from an earlier session"
+    assert exit_reason(leftover, 6.0, NOW, SESSION, TradingSettings(hold_overnight=True)) is None
+
+
+# --- Partial fills and rejections ------------------------------------------------------------------------------------
+
+
+def test_partly_filled_entry_cancels_the_rest_and_manages_what_filled(fake_ib):
+    announcer = RecordingAnnouncer()
+    trader = announcing_trader(announcer, contracts=5, max_premium=100_000)
+    trader.place_straddle("AAPL", LONG)
+    [ib] = fake_ib.instances
+    ib.trade_objects[0].partial_fill(2, 6.05)
+
+    trader.manage_positions(NOW, SESSION)
+
+    assert ib.cancelled == [1]
+    position = trader.positions["AAPL"]
+    assert position.filled and position.spec.quantity == 2 and position.entry_price == 6.05
+    assert "2 of 5" in announcer.messages[-1][1]
+
+    trader.manage_positions(NEAR_CLOSE, SESSION)
+
+    [_, (_, exit_order)] = ib.orders
+    assert exit_order.totalQuantity == 2  # exactly what is held
+
+
+def test_entry_partly_filled_at_the_close_is_closed_rather_than_dropped(fake_ib):
+    trader, ib = open_long(contracts=5, max_premium=100_000)
+    ib.trade_objects[0].partial_fill(2, 6.05)
+
+    trader.manage_positions(NEAR_CLOSE, SESSION)
+
+    assert ib.cancelled == [1]
+    [_, (_, exit_order)] = ib.orders
+    assert (exit_order.action, exit_order.totalQuantity) == ("SELL", 2)
+
+
+def test_fills_that_arrive_before_ib_confirms_the_cancel_are_kept(fake_ib):
+    fake_ib.cancel_status = "PendingCancel"
+    trader, ib = open_long(contracts=5, max_premium=100_000)
+    trade = ib.trade_objects[0]
+    trade.partial_fill(2, 6.05)
+
+    trader.manage_positions(NOW, SESSION)
+    assert ib.cancelled == [1]
+    assert not trader.positions["AAPL"].filled  # the final quantity is not known yet
+
+    trader.manage_positions(NOW, SESSION)
+    assert ib.cancelled == [1]  # asked once
+
+    trade.orderStatus.status = "Cancelled"
+    trade.orderStatus.filled = 3
+
+    trader.manage_positions(NOW, SESSION)
+    assert trader.positions["AAPL"].filled and trader.positions["AAPL"].spec.quantity == 3
+
+
+def test_unfilled_entry_stays_in_the_book_until_ib_confirms_the_cancel(fake_ib):
+    fake_ib.cancel_status = "PendingCancel"
+    trader, ib = open_long()
+
+    trader.manage_positions(NEAR_CLOSE, SESSION)
+    trader.manage_positions(NEAR_CLOSE, SESSION)
+
+    assert ib.cancelled == [1]
+    assert "AAPL" in trader.positions
+
+    ib.trade_objects[0].cancel()
+    trader.manage_positions(NEAR_CLOSE, SESSION)
+
+    assert trader.positions == {}
+
+
+def test_partly_filled_exit_is_booked_and_replaced_only_for_what_is_left(fake_ib):
+    trader, ib = open_long(contracts=3, max_premium=100_000)
+    ib.trade_objects[0].fill(6.0)
+    quote_atm(5.0, 5.2, 4.0, 4.2)
+    trader.manage_positions(NOW, SESSION)
+    exit_trade = ib.trade_objects[1]
+    exit_trade.partial_fill(1, 9.1)
+    exit_trade.cancel()
+
+    trader.manage_positions(NOW, SESSION)
+
+    assert trader.realized_today(TODAY) == pytest.approx((9.1 - 6.0) * 100)
+    assert trader.positions["AAPL"].spec.quantity == 2
+    [_, _, (_, new_exit)] = ib.orders
+    assert new_exit.totalQuantity == 2  # closing all 3 again would leave the straddle short
+
+
+def test_exit_partly_filled_while_disconnected_is_replaced_only_for_what_is_left(fake_ib):
+    trader, ib = open_long(contracts=3, max_premium=100_000)
+    ib.trade_objects[0].fill(6.0)
+    quote_atm(5.0, 5.2, 4.0, 4.2)
+    trader.manage_positions(NOW, SESSION)
+    disconnect(ib)
+    fake_ib.held = held_legs(1001, 1002)
+    fake_ib.executions = todays_entry(order_id=1, shares=3) + todays_exit(5.0, 4.1, order_id=2, shares=1)
+
+    trader.manage_positions(NOW, SESSION)
+
+    assert trader.realized_today(TODAY) == pytest.approx((9.1 - 6.0) * 100)
+    [(_, new_exit)] = fake_ib.instances[1].orders
+    assert new_exit.totalQuantity == 2
+
+
+def test_rejected_entry_frees_its_slot_and_is_announced(fake_ib):
+    announcer = RecordingAnnouncer()
+    trader = announcing_trader(announcer, max_open_positions=1)
+    trader.place_straddle("AAPL", LONG)
+    [ib] = fake_ib.instances
+    ib.trade_objects[0].reject()
+
+    trader.manage_positions(NOW, SESSION)
+
+    assert trader.positions == {}
+    assert announcer.messages[-1][0] == "Straddle entry rejected"
+    assert trader.place_straddle("MSFT", LONG) is not None  # the open slot is free
+    assert trader.place_straddle("AAPL", LONG) is None  # but the ticker is not retried today
+
+
+def test_rejected_exit_is_placed_again_and_announced_once(fake_ib):
+    announcer = RecordingAnnouncer()
+    trader = announcing_trader(announcer)
+    trader.place_straddle("AAPL", LONG)
+    [ib] = fake_ib.instances
+    ib.trade_objects[0].fill(6.0)
+    quote_atm(5.0, 5.2, 4.0, 4.2)
+    trader.manage_positions(NOW, SESSION)
+
+    for attempt in (1, 2):
+        ib.trade_objects[attempt].reject()
+        trader.manage_positions(NOW, SESSION)
+
+    assert len(ib.orders) == 4  # the entry and three exit attempts
+    subjects = [subject for subject, _ in announcer.messages]
+    assert subjects.count("Straddle exit rejected") == 1
+
+
+# --- Against ib_async's own order bookkeeping -------------------------------------------------------------------------
+
+
+class WiredIB(IB):
+    """A real ib_async client with only the socket cut: placing, modifying and cancelling orders and applying status
+    updates all run through ib_async's own code, so these tests also check what the FakeIB tests assume about it."""
+
+    connect = FakeIB.connect
+    isConnected = FakeIB.isConnected  # noqa: N815
+    disconnect = FakeIB.disconnect
+    managedAccounts = FakeIB.managedAccounts  # noqa: N815
+    reqMarketDataType = FakeIB.reqMarketDataType  # noqa: N815
+    qualifyContracts = FakeIB.qualifyContracts  # noqa: N815
+    reqTickers = FakeIB.reqTickers  # noqa: N815
+    reqSecDefOptParams = FakeIB.reqSecDefOptParams  # noqa: N815
+    positions = FakeIB.positions
+    reqExecutions = FakeIB.reqExecutions  # noqa: N815
+
+    instances = []
+
+    def __init__(self):
+        super().__init__()
+        self.connected = False
+        self.calls = []
+        self.sent = []
+        self.wrapper.clientId = 2
+        order_ids = iter(range(1, 100))
+        self.client.getReqId = lambda: next(order_ids)
+        self.client.placeOrder = lambda order_id, contract, order: self.sent.append(
+            ("place", order_id, order.action, order.totalQuantity, order.lmtPrice)
+        )
+        self.client.cancelOrder = lambda order_id, manual_time="": self.sent.append(("cancel", order_id))
+        WiredIB.instances.append(self)
+
+    def report(self, order_id, status, filled=0.0, price=0.0):
+        """What TWS sends back about an order."""
+        self.wrapper.orderStatus(order_id, status, filled, 0.0, price, order_id + 1000, 0, price, 2, "")
+
+
+def wired_trader(**overrides):
+    WiredIB.instances = []
+    settings = TradingSettings(**{"enabled": True, "transmit": True, **overrides})
+    return IBKRStraddleTrader(settings, ib_factory=WiredIB, today=lambda: TODAY)
+
+
+def test_ib_async_moving_an_exit_modifies_the_order_instead_of_adding_one(fake_ib):
+    trader = wired_trader()
+    trader.place_straddle("AAPL", LONG)
+    [ib] = WiredIB.instances
+    ib.report(1, "Filled", filled=1.0, price=6.0)
+    quote_atm(1.4, 1.5, 1.4, 1.5)
+    trader.manage_positions(NOW, SESSION)  # stop-loss exit at 2.80
+    ib.report(2, "Submitted")
+    quote_atm(0.5, 0.6, 0.5, 0.6)
+
+    trader.manage_positions(NOW, SESSION)
+
+    assert ib.sent[-2:] == [("place", 2, "SELL", 1, pytest.approx(2.8)), ("place", 2, "SELL", 1, pytest.approx(1.0))]
+    assert len(ib.trades()) == 2  # the entry and one exit
+    exit_trade = next(trade for trade in ib.trades() if trade.order.orderId == 2)
+    assert exit_trade.order.lmtPrice == pytest.approx(1.0)
+    assert exit_trade.log[-1].message == "Modify"
+
+    ib.report(2, "Filled", filled=1.0, price=1.0)
+    trader.manage_positions(NOW, SESSION)
+
+    assert trader.positions == {}
+    assert trader.realized_today(TODAY) == pytest.approx((1.0 - 6.0) * 100)
+
+
+def test_ib_async_part_filled_entry_waits_for_the_cancel_to_be_confirmed(fake_ib):
+    trader = wired_trader(contracts=5, max_premium=100_000)
+    trader.place_straddle("AAPL", LONG)
+    [ib] = WiredIB.instances
+    ib.report(1, "Submitted", filled=2.0, price=6.05)
+
+    trader.manage_positions(NOW, SESSION)
+
+    assert ("cancel", 1) in ib.sent
+    assert ib.trades()[0].orderStatus.status == "PendingCancel"
+    assert not trader.positions["AAPL"].filled
+
+    trader.manage_positions(NOW, SESSION)
+    assert ib.sent.count(("cancel", 1)) == 1
+
+    ib.report(1, "Cancelled", filled=3.0, price=6.05)
+    trader.manage_positions(NOW, SESSION)
+
+    position = trader.positions["AAPL"]
+    assert position.filled and position.spec.quantity == 3 and position.entry_price == 6.05
+
+
+def test_ib_async_a_staged_entry_is_cancelled_at_once(fake_ib):
+    trader = wired_trader(transmit=False)
+    trader.place_straddle("AAPL", LONG)
+
+    trader.manage_positions(NEAR_CLOSE, SESSION)
+
+    assert trader.positions == {}  # ib_async cancels an order that was never transmitted without asking TWS
+
+
+def test_ib_async_rejected_entry_is_forgotten_and_a_rejected_exit_retried(fake_ib):
+    trader = wired_trader()
+    trader.place_straddle("AAPL", LONG)
+    trader.place_straddle("MSFT", LONG)
+    [ib] = WiredIB.instances
+    ib.report(1, "Inactive")
+    ib.report(2, "Filled", filled=1.0, price=6.0)
+    quote_atm(5.0, 5.2, 4.0, 4.2)
+
+    trader.manage_positions(NOW, SESSION)
+
+    assert list(trader.positions) == ["MSFT"]
+    assert trader.positions["MSFT"].exit_order_id == 3
+
+    ib.report(3, "Inactive")
+    trader.manage_positions(NOW, SESSION)
+
+    assert trader.positions["MSFT"].exit_order_id == 4  # a new order: ib_async refuses to modify a finished one

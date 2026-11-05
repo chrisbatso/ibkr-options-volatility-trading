@@ -31,7 +31,7 @@ Requires the optional dependency: ``pip install "market_watcher[ibkr]"``.
 """
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
 
 from market_watcher.common import STRATEGIES, VALID_STRATEGIES
@@ -45,9 +45,14 @@ SHORT = STRATEGIES.SHORT_STRADDLE.value
 PAPER_ACCOUNT_PREFIX = "DU"
 ORDER_REF = "MarketWatcher"  # tags entry orders, so the book can be rebuilt from executions
 EXIT_REF = "MarketWatcher-exit"
+HALT_EXIT_REF = "MarketWatcher-exit-halt"  # an exit forced by the daily loss limit: IB remembers the halt for a restart
+EXIT_REFS = frozenset({EXIT_REF, HALT_EXIT_REF})
 STRIKE_ATTEMPTS = 3  # how many strikes around the money to try before giving up on a ticker
 FILLED = "Filled"
-DEAD_ORDER_STATUSES = {"Cancelled", "ApiCancelled"}
+REJECTED = "Inactive"
+DEAD_ORDER_STATUSES = {"Cancelled", "ApiCancelled", REJECTED}
+DAILY_LOSS_REASON = "daily loss limit"
+RECOVERED_EXIT_REASON = "exit order from an earlier run"
 
 
 def parse_strategies(text):
@@ -196,6 +201,18 @@ class OpenStraddle:
     exit_order_id: int | None = None
     exit_price: float | None = None
     exit_reason: str | None = None
+    exit_contracts_booked: int = 0  # contracts the working exit had closed before this run: already off the quantity
+    cancel_requested: bool = False  # the entry is being cancelled; it stays in the book until IB confirms
+    exit_rejection_announced: bool = False
+
+    @property
+    def leg_ids(self):
+        return self.call.conId, self.put.conId
+
+    def forget_exit(self):
+        """The exit order is gone: the position is open again, for the next exit to close."""
+        self.exit_order_id = self.exit_price = self.exit_reason = None
+        self.exit_contracts_booked = 0
 
 
 @dataclass(frozen=True)
@@ -290,9 +307,17 @@ def exit_reason(position, value, now, session, settings):
         stop = entry * (1 - settings.stop_loss_pct / 100) if long else entry * (1 + settings.stop_loss_pct / 100)
         if (long and value <= stop) or (not long and value >= stop):
             return f"stop loss ({value:.2f} vs entry {entry:.2f})"
-    if not settings.hold_overnight and now >= session.close - timedelta(minutes=settings.exit_minutes_before_close):
-        return "session close"
+    if not settings.hold_overnight:
+        if now >= session.close - timedelta(minutes=settings.exit_minutes_before_close):
+            return "session close"
+        if position.opened_on < session.day:  # its exit expired unfilled at an earlier close
+            return "left open from an earlier session"
     return None
+
+
+def is_patient(reason):
+    """A take-profit can wait for its price; any other exit has to get out, so its order follows the market."""
+    return reason.startswith("take profit") or reason == RECOVERED_EXIT_REASON
 
 
 def exit_limit(position, quote, reason, buffer_pct):
@@ -310,11 +335,26 @@ def exit_limit(position, quote, reason, buffer_pct):
 # --- Trader ----------------------------------------------------------------------------------------------------------
 
 
-def _fills_by_leg(fills, order_ref):
-    """Shares and cost per option conId among today's executions tagged with ``order_ref``."""
+def _leg_fills(fills):
+    """The executions of option legs: IB also reports a combo as a whole, which would count everything twice."""
+    return [fill for fill in fills if fill.contract.secType != "BAG"]
+
+
+def _order_ref(fill):
+    return getattr(fill.execution, "orderRef", "")
+
+
+def _is_working(trade):
+    return trade.orderStatus.status != FILLED and trade.orderStatus.status not in DEAD_ORDER_STATUSES
+
+
+def _fills_by_leg(fills, order_refs, order_id=None):
+    """Shares and cost per option conId among today's executions tagged with ``order_refs`` (of one order, if given)."""
     by_leg = {}
     for fill in fills:
-        if getattr(fill.execution, "orderRef", "") != order_ref:
+        if _order_ref(fill) not in order_refs:
+            continue
+        if order_id is not None and fill.execution.orderId != order_id:
             continue
         shares, cost = by_leg.get(fill.contract.conId, (0.0, 0.0))
         by_leg[fill.contract.conId] = (
@@ -327,12 +367,38 @@ def _fills_by_leg(fills, order_ref):
 def _fill_price(by_leg, position):
     """Average net price per unit of ``position``'s two legs from ``by_leg``, or None without fills for both."""
     total = 0.0
-    for leg in (position.call, position.put):
-        shares, cost = by_leg.get(leg.conId, (0.0, 0.0))
+    for con_id in position.leg_ids:
+        shares, cost = by_leg.get(con_id, (0.0, 0.0))
         if not shares:
             return None
         total += cost / shares
     return total
+
+
+def _filled_contracts(by_leg, leg_ids):
+    """Straddles complete in ``by_leg``: a contract counts once both its legs have filled."""
+    return int(min(by_leg.get(con_id, (0.0, 0.0))[0] for con_id in leg_ids))
+
+
+def _realized_by_ticker(fills):
+    """USD realized per ticker by today's tagged executions of option legs.
+
+    Only straddles whose entry and exit both executed today can be valued: IB reports executions
+    per day, so the exit of an overnight hold has no entry here to compare it with.
+    """
+    realized = {}
+    for ticker in {fill.contract.symbol for fill in fills}:
+        own = [fill for fill in fills if fill.contract.symbol == ticker]
+        entries, exits = _fills_by_leg(own, {ORDER_REF}), _fills_by_leg(own, EXIT_REFS)
+        if len(entries) != 2 or set(entries) != set(exits):
+            continue
+        entry_fill = next(fill for fill in own if _order_ref(fill) == ORDER_REF)
+        sign = 1 if entry_fill.execution.side == "BOT" else -1
+        entry_net = sum(cost / shares for shares, cost in entries.values())
+        exit_net = sum(cost / shares for shares, cost in exits.values())
+        multiplier = int(entry_fill.contract.multiplier or 100)
+        realized[ticker] = (exit_net - entry_net) * multiplier * _filled_contracts(exits, entries) * sign
+    return realized
 
 
 class IBKRStraddleTrader:
@@ -349,7 +415,7 @@ class IBKRStraddleTrader:
         self._ib = None
         self._today = today or date.today
         self._day = None
-        self._placed_today = {}
+        self._placed_today = set()
         self._halted_on = None  # the day the daily loss limit was hit
         self._realized = []  # (day, ticker, USD)
         self._needs_sync = False  # set by _connect() on every new connection: reconcile the book with IB first
@@ -415,6 +481,8 @@ class IBKRStraddleTrader:
         today = self._today()
         self._roll_day(today)
         settings = self.settings
+        ib = self._connect()
+        self._ensure_synced(ib, today)  # what an earlier run left at IB counts against every check below
         if self._halted_on == today:
             logger.warning("Daily loss limit was hit today; not opening %s", ticker)
             return None
@@ -428,7 +496,6 @@ class IBKRStraddleTrader:
             logger.warning("Already %d open position(s); not opening %s", len(self.positions), ticker)
             return None
 
-        ib = self._connect()
         spec = self.build_straddle(ib, ticker, strategy, today)
         check_limits(spec, settings)
 
@@ -449,7 +516,7 @@ class IBKRStraddleTrader:
             position = OpenStraddle(spec, spec.call, spec.put, trade.order.orderId, spec.limit_price, False, today)
             self._announce("Straddle order placed", f"{spec.describe()}\nOrder id {trade.order.orderId}: {placement}")
         self.positions[ticker] = position
-        self._placed_today[ticker] = spec
+        self._placed_today.add(ticker)
         return spec
 
     def build_straddle(self, ib, ticker, strategy, today):
@@ -547,10 +614,7 @@ class IBKRStraddleTrader:
         settings = self.settings
 
         ib = self._connect()
-        if self._needs_sync:
-            if not settings.dry_run:  # dry-run positions are virtual: IB knows nothing about them
-                self._sync_book(ib, today)
-            self._needs_sync = False
+        self._ensure_synced(ib, today)
         self._refresh_orders(ib, today)
         near_close = now >= session.close - timedelta(minutes=settings.exit_minutes_before_close)
         if not self.positions:
@@ -558,15 +622,16 @@ class IBKRStraddleTrader:
             return
 
         closing_time = not settings.hold_overnight and near_close
-        open_positions = [p for p in self.positions.values() if p.filled and p.exit_order_id is None]
+        held = [p for p in self.positions.values() if p.filled]  # an exit still working leaves the risk on the book
         pending_entries = [p for p in self.positions.values() if not p.filled and p.entry_order_id is not None]
-        quotes = self._quotes(ib, open_positions)
+        quotes = self._quotes(ib, held)
 
-        unrealized = sum(
-            unrealized_pnl(p, quotes[p.spec.ticker].mid) for p in open_positions if p.spec.ticker in quotes
-        )
+        unrealized = sum(unrealized_pnl(p, quotes[p.spec.ticker].mid) for p in held if p.spec.ticker in quotes)
         day_pnl = self.realized_today(today) + unrealized
-        if settings.max_daily_loss > 0 and day_pnl <= -settings.max_daily_loss and self._halted_on != today:
+        limit_just_hit = (
+            settings.max_daily_loss > 0 and day_pnl <= -settings.max_daily_loss and self._halted_on != today
+        )
+        if limit_just_hit:
             self._halted_on = today
             logger.error(
                 "Daily loss limit hit (realized %+.0f, unrealized %+.0f, limit %.0f USD): closing everything, "
@@ -575,35 +640,40 @@ class IBKRStraddleTrader:
                 unrealized,
                 settings.max_daily_loss,
             )
-            for position in open_positions:
-                if position.spec.ticker in quotes:
-                    self._close(ib, position, quotes[position.spec.ticker], "daily loss limit", today)
+        halted = self._halted_on == today
+
+        for position in held:
+            quote = quotes.get(position.spec.ticker)
+            if quote is None:
+                continue
+            reason = DAILY_LOSS_REASON if halted else exit_reason(position, quote.mid, now, session, settings)
+            if position.exit_order_id is not None:
+                self._follow_market(ib, position, quote, reason)
+            elif reason:
+                self._close(ib, position, quote, reason, today)
+
+        if halted or closing_time:
             for position in pending_entries:
                 self._cancel_entry(ib, position)
+        if limit_just_hit:
             self._announce(
                 "Daily loss limit hit",
                 f"Realized {self.realized_today(today):+,.0f} USD, unrealized {unrealized:+,.0f} USD, "
                 f"limit {settings.max_daily_loss:,.0f} USD: closing everything; no new positions today",
             )
-            return
-
-        for position in open_positions:
-            quote = quotes.get(position.spec.ticker)
-            if quote is None:
-                continue
-            reason = exit_reason(position, quote.mid, now, session, settings)
-            if reason:
-                self._close(ib, position, quote, reason, today)
-
-        if closing_time:
-            for position in pending_entries:
-                self._cancel_entry(ib, position)
         self._maybe_summarize(today, near_close)
+
+    def _ensure_synced(self, ib, today):
+        """Reconciles the book with a new connection before anything acts on it."""
+        if self._needs_sync:
+            if not self.settings.dry_run:  # dry-run positions are virtual: IB knows nothing about them
+                self._sync_book(ib, today)
+            self._needs_sync = False
 
     def _roll_day(self, today):
         if today != self._day:
             self._day = today
-            self._placed_today = {}
+            self._placed_today = set()
 
     def _quotes(self, ib, positions):
         quotes = {}
@@ -619,7 +689,7 @@ class IBKRStraddleTrader:
     def _refresh_orders(self, ib, today):
         """Applies fills and cancellations reported by IB to the book."""
         trades = {trade.order.orderId: trade for trade in ib.trades()}
-        for ticker, position in list(self.positions.items()):
+        for position in list(self.positions.values()):
             if position.exit_order_id is not None:
                 trade = trades.get(position.exit_order_id)
                 if trade is None:
@@ -629,26 +699,132 @@ class IBKRStraddleTrader:
                     price = trade.orderStatus.avgFillPrice or position.exit_price
                     self._record_close(position, price, today, position.exit_reason)
                 elif status in DEAD_ORDER_STATUSES:
-                    logger.warning(
-                        "Exit order %s for %s was cancelled; it will be placed again", trade.order.orderId, ticker
-                    )
-                    position.exit_order_id = position.exit_price = position.exit_reason = None
+                    self._exit_order_died(position, trade, today)
                 continue
             if not position.filled and position.entry_order_id is not None:
                 trade = trades.get(position.entry_order_id)
-                if trade is None:
-                    continue
-                status = trade.orderStatus.status
-                if status == FILLED:
-                    position.filled = True
-                    position.entry_price = trade.orderStatus.avgFillPrice or position.entry_price
-                    self._announce(
-                        "Straddle entry filled", f"{position.spec.describe()}\nFilled at {position.entry_price:.2f}"
-                    )
-                    logger.info("Entry filled: %s at %.2f", position.spec.describe(), position.entry_price)
-                elif status in DEAD_ORDER_STATUSES:
-                    logger.warning("Entry order %s for %s was cancelled; forgetting it", trade.order.orderId, ticker)
-                    del self.positions[ticker]
+                if trade is not None:
+                    self._settle_entry(ib, position, trade)
+
+    def _settle_entry(self, ib, position, trade):
+        """Applies what IB reports about a working entry order to the book."""
+        ticker = position.spec.ticker
+        status = trade.orderStatus.status
+        filled = int(trade.orderStatus.filled)
+        price = trade.orderStatus.avgFillPrice
+        if status == FILLED:
+            self._mark_entry_filled(position, position.spec.quantity, price)
+        elif status in DEAD_ORDER_STATUSES and filled:
+            self._mark_entry_filled(position, filled, price)
+        elif status == REJECTED:
+            logger.error("Entry order %s for %s was rejected by IB; forgetting it", trade.order.orderId, ticker)
+            del self.positions[ticker]
+            self._announce(
+                "Straddle entry rejected",
+                f"{position.spec.describe()}\nOrder id {trade.order.orderId} was rejected by IB; see TWS for why",
+            )
+        elif status in DEAD_ORDER_STATUSES:
+            logger.warning("Entry order %s for %s was cancelled; forgetting it", trade.order.orderId, ticker)
+            del self.positions[ticker]
+        elif filled and not position.cancel_requested:
+            # A limit order still part-filled at the next poll has gone stale: stop it and manage what it bought,
+            # rather than leave open risk outside the stops until the order completes.
+            self._cancel_entry(ib, position)
+
+    def _mark_entry_filled(self, position, contracts, price):
+        ordered = position.spec.quantity
+        position.filled = True
+        position.entry_price = price or position.entry_price
+        note = ""
+        if contracts < ordered:
+            position.spec = replace(position.spec, quantity=contracts)
+            note = f" ({contracts} of {ordered} contracts; the rest was cancelled)"
+        self._announce(
+            "Straddle entry filled", f"{position.spec.describe()}\nFilled at {position.entry_price:.2f}{note}"
+        )
+        logger.info("Entry filled: %s at %.2f%s", position.spec.describe(), position.entry_price, note)
+
+    def _exit_order_died(self, position, trade, today):
+        """A cancelled or rejected exit: books whatever it did close and leaves the rest to be closed again."""
+        ticker = position.spec.ticker
+        order_id = trade.order.orderId
+        filled = int(trade.orderStatus.filled) - position.exit_contracts_booked
+        if filled:
+            self._book_partial_exit(position, filled, trade.orderStatus.avgFillPrice or position.exit_price, today)
+            if ticker not in self.positions:
+                return
+        if trade.orderStatus.status == REJECTED:
+            logger.error("Exit order %s for %s was rejected by IB; it will be placed again", order_id, ticker)
+            if not position.exit_rejection_announced:
+                position.exit_rejection_announced = True
+                self._announce(
+                    "Straddle exit rejected",
+                    f"{ticker}: exit order {order_id} was rejected by IB. The bot keeps trying while the position "
+                    "is open; see TWS for the reason",
+                )
+        else:
+            logger.warning("Exit order %s for %s was cancelled; it will be placed again", order_id, ticker)
+        position.forget_exit()
+
+    def _book_partial_exit(self, position, contracts, price, today):
+        """Books the contracts a dead exit order closed: the next exit must cover only the rest, or it goes short."""
+        ticker = position.spec.ticker
+        if contracts >= position.spec.quantity:
+            self._record_close(position, price, today, f"{position.exit_reason}; fully filled")
+            return
+        pnl = unrealized_pnl(position, price) * contracts / position.spec.quantity
+        self._realized.append((today, ticker, pnl))
+        position.spec = replace(position.spec, quantity=position.spec.quantity - contracts)
+        self._announce(
+            "Straddle partly closed",
+            f"{ticker}: {contracts} contract(s) closed at {price:.2f}: {pnl:+,.0f} USD; "
+            f"{position.spec.quantity} still open",
+        )
+        logger.info("Closed %d contract(s) of the %s straddle at %.2f: %+.0f USD", contracts, ticker, price, pnl)
+
+    def _follow_market(self, ib, position, quote, reason):
+        """Keeps a working exit able to fill.
+
+        A take-profit waits for its price while no rule fires. Once one does, or for any exit that
+        has to get out, the limit follows the market, in place so that there is never a second
+        live exit that could flip the position. It only ever moves towards a fill. In staged mode
+        each new price waits for another click in TWS, like the order itself.
+        """
+        ticker = position.spec.ticker
+        escalated = False
+        if is_patient(position.exit_reason):
+            if reason is None:
+                return
+            escalated = not is_patient(reason)
+            position.exit_reason = reason
+        limit = exit_limit(position, quote, position.exit_reason, self.settings.limit_buffer_pct)
+        selling = position.spec.action == "BUY"
+        if (selling and limit >= position.exit_price) or (not selling and limit <= position.exit_price):
+            return
+        trade = self._trade(ib, position.exit_order_id)
+        if trade is None or not _is_working(trade):  # it can finish while the quotes are being fetched
+            return
+        trade.order.lmtPrice = limit
+        trade.order.transmit = self.settings.transmit  # an order recovered from IB defaults to transmit=True
+        ib.placeOrder(trade.contract, trade.order)
+        logger.info(
+            "Exit order %s for %s moved from %.2f to %.2f (%s)",
+            position.exit_order_id,
+            ticker,
+            position.exit_price,
+            limit,
+            position.exit_reason,
+        )
+        position.exit_price = limit
+        if escalated:
+            self._announce(
+                "Closing straddle",
+                f"{ticker}: exit moved to {limit:.2f} ({position.exit_reason}) - order id {position.exit_order_id}",
+            )
+
+    @staticmethod
+    def _trade(ib, order_id):
+        return next((trade for trade in ib.trades() if trade.order.orderId == order_id), None)
 
     def _close(self, ib, position, quote, reason, today):
         ticker = position.spec.ticker
@@ -661,7 +837,8 @@ class IBKRStraddleTrader:
             logger.info("DRY RUN - would close the %s straddle at %.2f (%s): %+.0f USD", ticker, limit, reason, pnl)
             self._announce("Straddle closed", f"Would close {ticker} at {limit:.2f} ({reason}): {pnl:+,.0f} USD")
             return
-        trade = ib.placeOrder(position.spec.contract, self._order(action, position.spec.quantity, limit, EXIT_REF))
+        reference = HALT_EXIT_REF if reason == DAILY_LOSS_REASON else EXIT_REF
+        trade = ib.placeOrder(position.spec.contract, self._order(action, position.spec.quantity, limit, reference))
         position.exit_order_id = trade.order.orderId
         position.exit_price = limit
         position.exit_reason = reason
@@ -697,14 +874,15 @@ class IBKRStraddleTrader:
         """Reconciles the book with IB after a (re)connection.
 
         Applies the fills, cancellations and closes that happened while disconnected, using
-        IB's positions, open orders and the day's executions, then recovers straddles opened
-        by an earlier run (see _rebuild_book).
+        IB's positions, open orders and the day's executions, recovers what an earlier run left
+        at IB (see _rebuild_book) and restores the day's limits (see _restore_day).
         """
-        fills = list(ib.reqExecutions())
+        fills = _leg_fills(ib.reqExecutions())
         held = {position.contract.conId for position in ib.positions() if position.position}
-        open_order_ids = {trade.order.orderId for trade in ib.trades()}
-        entry_fills = _fills_by_leg(fills, ORDER_REF)
-        exit_fills = _fills_by_leg(fills, EXIT_REF)
+        trades = ib.trades()
+        open_order_ids = {trade.order.orderId for trade in trades}
+        exit_fills = _fills_by_leg(fills, EXIT_REFS)
+        known = set(self.positions)  # what this run already tracks, each with its own accounting of partial exits
 
         for ticker, position in list(self.positions.items()):
             legs_held = position.call.conId in held and position.put.conId in held
@@ -713,12 +891,17 @@ class IBKRStraddleTrader:
                     price = _fill_price(exit_fills, position) or position.exit_price
                     self._record_close(position, price, today, f"{position.exit_reason}; fill detected after reconnect")
                 elif position.exit_order_id not in open_order_ids:
-                    logger.warning(
-                        "Exit order %s for %s is gone after the reconnect; it will be placed again",
-                        position.exit_order_id,
-                        ticker,
-                    )
-                    position.exit_order_id = position.exit_price = position.exit_reason = None
+                    own = _fills_by_leg(fills, EXIT_REFS, position.exit_order_id)
+                    closed = _filled_contracts(own, position.leg_ids) - position.exit_contracts_booked
+                    if closed:
+                        self._book_partial_exit(position, closed, _fill_price(own, position), today)
+                    if ticker in self.positions:
+                        logger.warning(
+                            "Exit order %s for %s is gone after the reconnect; it will be placed again",
+                            position.exit_order_id,
+                            ticker,
+                        )
+                        position.forget_exit()
             elif position.filled:
                 if not legs_held:
                     price = _fill_price(exit_fills, position)
@@ -729,45 +912,140 @@ class IBKRStraddleTrader:
                         del self.positions[ticker]
                     else:
                         self._record_close(position, price, today, "closed while disconnected")
-            elif legs_held:
-                position.filled = True
-                position.entry_price = _fill_price(entry_fills, position) or position.entry_price
-                logger.info(
-                    "Entry filled while disconnected: %s at %.2f", position.spec.describe(), position.entry_price
-                )
-                self._announce(
-                    "Straddle entry filled", f"{position.spec.describe()}\nFilled at {position.entry_price:.2f}"
-                )
-            elif position.entry_order_id not in open_order_ids:
-                logger.warning(
-                    "Entry order %s for %s is gone after the reconnect; forgetting it", position.entry_order_id, ticker
-                )
-                del self.positions[ticker]
+            else:
+                # Holding the legs proves nothing by itself: only this order's own fills say it filled.
+                own = _fills_by_leg(fills, {ORDER_REF}, position.entry_order_id)
+                filled = _filled_contracts(own, position.leg_ids)
+                order_open = position.entry_order_id in open_order_ids
+                if legs_held and filled and (filled >= position.spec.quantity or not order_open):
+                    self._mark_entry_filled(position, filled, _fill_price(own, position))
+                elif not order_open:
+                    logger.warning(
+                        "Entry order %s for %s is gone after the reconnect; forgetting it",
+                        position.entry_order_id,
+                        ticker,
+                    )
+                    del self.positions[ticker]
 
-        self._rebuild_book(ib, today, fills=fills, held=held)
+        self._rebuild_book(ib, today, fills, held, trades, known)
+        self._restore_day(today, fills, trades, known)
+
+    def _restore_day(self, today, fills, trades, known):
+        """Rebuilds the day's limits from what IB remembers, so that restarting the bot cannot reset them.
+
+        Entries that never filled and are no longer working leave no trace to count, so the order
+        cap can only forget those. Realized P&L is restored only for what this run does not already
+        account for (``known``): the bot trades a ticker once a day, so a ticker identifies its trade.
+        """
+        working = [trade for trade in trades if _is_working(trade)]
+        self._placed_today |= {fill.contract.symbol for fill in fills if _order_ref(fill) == ORDER_REF}
+        self._placed_today |= {trade.contract.symbol for trade in working if trade.order.orderRef == ORDER_REF}
+
+        booked = known | {ticker for day, ticker, _ in self._realized if day == today}
+        for ticker, pnl in _realized_by_ticker(fills).items():
+            if ticker not in booked:
+                self._realized.append((today, ticker, pnl))
+
+        limit = self.settings.max_daily_loss
+        if limit <= 0 or self._halted_on == today:
+            return
+        tagged = any(_order_ref(fill) == HALT_EXIT_REF for fill in fills) or any(
+            trade.order.orderRef == HALT_EXIT_REF for trade in working
+        )
+        if tagged or self.realized_today(today) <= -limit:
+            self._halted_on = today
+            logger.error(
+                "The daily loss limit was already hit today (realized %+.0f USD): closing what is open, "
+                "no new positions today",
+                self.realized_today(today),
+            )
 
     def _cancel_entry(self, ib, position):
+        """Cancels a working entry. It stays in the book until IB confirms: fills can still arrive until then."""
         ticker = position.spec.ticker
-        for trade in ib.trades():
-            if trade.order.orderId == position.entry_order_id:
-                ib.cancelOrder(trade.order)
-        del self.positions[ticker]
-        logger.info("Cancelled the unfilled entry for %s (order id %s)", ticker, position.entry_order_id)
+        trade = self._trade(ib, position.entry_order_id)
+        if trade is None:
+            logger.warning("Entry order %s for %s is unknown to IB; forgetting it", position.entry_order_id, ticker)
+            del self.positions[ticker]
+            return
+        if not position.cancel_requested:
+            position.cancel_requested = True
+            ib.cancelOrder(trade.order)
+            logger.info("Cancelling the entry for %s (order id %s)", ticker, position.entry_order_id)
+        self._settle_entry(ib, position, trade)
 
-    def _rebuild_book(self, ib, today, fills=None, held=None):
-        """Recovers straddles opened today by an earlier run from IB's executions tagged with our order reference."""
+    def _recover_working_entry(self, ib, trade, today):
+        """Puts an entry order an earlier run left working back in the book, so that its fill gets managed."""
+        from ib_async import Contract
+
+        ticker = trade.contract.symbol
+        order_id = trade.order.orderId
+        legs = [Contract(conId=leg.conId, exchange="SMART") for leg in trade.contract.comboLegs]
+        ib.qualifyContracts(*legs)
+        call = next((leg for leg in legs if leg.right == "C"), None)
+        put = next((leg for leg in legs if leg.right == "P"), None)
+        if call is None or put is None:
+            logger.error("Could not resolve the legs of working order %s on %s; check it in TWS", order_id, ticker)
+            return
+        action = trade.order.action
+        limit = trade.order.lmtPrice
+        spec = StraddleSpec(
+            ticker=ticker,
+            strategy=LONG if action == "BUY" else SHORT,
+            action=action,
+            expiry=call.lastTradeDateOrContractMonth,
+            strike=call.strike,
+            underlying_price=0.0,  # unknown for a recovered order
+            call_price=0.0,
+            put_price=0.0,
+            limit_price=limit,
+            quantity=int(trade.order.totalQuantity),
+            multiplier=int(call.multiplier or 100),
+            contract=trade.contract,
+            call=call,
+            put=put,
+        )
+        self.positions[ticker] = OpenStraddle(spec, call, put, order_id, limit, False, today)
+        logger.info(
+            "Recovered the working %s entry on %s (order id %s, limit %.2f)", spec.strategy, ticker, order_id, limit
+        )
+
+    def _rebuild_book(self, ib, today, fills, held, trades, known):
+        """Recovers what an earlier run left at IB, found by our order references.
+
+        Working entries first, so that a part-filled one is settled by its order status; then
+        straddles opened today, from their executions, less what has been closed since; then
+        working exits, which must be adopted: placing another would leave the position short
+        once both filled.
+        """
+        working = [trade for trade in trades if _is_working(trade)]
+        for trade in working:
+            if trade.order.orderRef == ORDER_REF and trade.contract.symbol not in self.positions:
+                self._recover_working_entry(ib, trade, today)
+
+        self._recover_open_straddles(today, fills, held)
+
+        for trade in working:
+            if trade.order.orderRef not in EXIT_REFS:
+                continue
+            position = self.positions.get(trade.contract.symbol)
+            if position is not None and position.filled and position.exit_order_id is None:
+                position.exit_order_id = trade.order.orderId
+                position.exit_price = trade.order.lmtPrice
+                position.exit_reason = RECOVERED_EXIT_REASON
+                if position.spec.ticker not in known:  # recovered net of what this exit has already closed
+                    position.exit_contracts_booked = int(trade.orderStatus.filled)
+                logger.info("Adopted the working exit order %s for %s", trade.order.orderId, position.spec.ticker)
+
+    def _recover_open_straddles(self, today, fills, held):
+        """Straddles opened today by an earlier run and still open, from the executions tagged with our reference."""
         from ib_async import Bag, ComboLeg
 
-        if fills is None:
-            fills = list(ib.reqExecutions())
-        fills = [fill for fill in fills if getattr(fill.execution, "orderRef", "") == ORDER_REF]
-        if not fills:
-            return
-        if held is None:
-            held = {position.contract.conId for position in ib.positions() if position.position}
+        exits = _fills_by_leg(fills, EXIT_REFS)
         by_order = {}
         for fill in fills:
-            by_order.setdefault(fill.execution.orderId, []).append(fill)
+            if _order_ref(fill) == ORDER_REF:
+                by_order.setdefault(fill.execution.orderId, []).append(fill)
 
         for order_id, group in sorted(by_order.items()):
             legs = {}
@@ -787,6 +1065,11 @@ class IBKRStraddleTrader:
             ticker = call["contract"].symbol
             if ticker in self.positions:
                 continue
+            quantity = int(min(call["shares"], put["shares"])) - _filled_contracts(exits, legs)
+            if quantity <= 0:
+                continue  # closed since, with the legs held for some other reason
+            # An execution names the venue that filled it; quotes and orders must go through SMART.
+            call["contract"].exchange = put["contract"].exchange = "SMART"
 
             action = "BUY" if call["side"] == "BOT" else "SELL"
             call_price = call["cost"] / call["shares"]
@@ -801,7 +1084,7 @@ class IBKRStraddleTrader:
                 call_price=call_price,
                 put_price=put_price,
                 limit_price=call_price + put_price,
-                quantity=int(min(call["shares"], put["shares"])),
+                quantity=quantity,
                 multiplier=int(call["contract"].multiplier or 100),
                 contract=self._combo(ticker, call["contract"].conId, put["contract"].conId, Bag, ComboLeg),
                 call=call["contract"],

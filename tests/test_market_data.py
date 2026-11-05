@@ -1,6 +1,8 @@
 import math
 import sys
 from dataclasses import dataclass
+from datetime import date
+from types import SimpleNamespace
 
 import pytest
 
@@ -312,12 +314,25 @@ class FakeDownload:
         return self.frame
 
 
+class FixedSession:
+    """Market hours with the session of ``day`` in progress, or the market closed when ``day`` is None."""
+
+    def __init__(self, day=None):
+        self.day = day
+
+    def current_session(self, now):
+        return SimpleNamespace(day=self.day) if self.day else None
+
+
+CLOSED = FixedSession()
+
+
 def test_yfinance_provider_downloads_the_universe_once_and_uses_the_last_two_closes():
     download = FakeDownload(
         yfinance_frame({"AAPL": [100.0, 101.0, 102.0], "KO": [50.0, 50.0, 49.0], "DEAD": [None, None, None]})
     )
 
-    result = YFinanceProvider(download=download).get_daily_pnls(["AAPL", "KO", "DEAD", "MISSING"])
+    result = YFinanceProvider(download=download, market_hours=CLOSED).get_daily_pnls(["AAPL", "KO", "DEAD", "MISSING"])
 
     [(tickers, kwargs)] = download.calls
     assert tickers == ["AAPL", "KO", "DEAD", "MISSING"]
@@ -333,15 +348,17 @@ def test_yfinance_provider_downloads_the_universe_once_and_uses_the_last_two_clo
 
 
 def test_yfinance_provider_skips_days_without_a_close():
-    download = FakeDownload(yfinance_frame({"AAPL": [100.0, 110.0, None]}))  # today's bar not yet available
+    download = FakeDownload(yfinance_frame({"AAPL": [100.0, 110.0, None]}))
 
-    assert YFinanceProvider(download=download).get_daily_pnls(["AAPL"])["AAPL"] == pytest.approx(0.10)
+    assert YFinanceProvider(download=download, market_hours=CLOSED).get_daily_pnls(["AAPL"])["AAPL"] == pytest.approx(
+        0.10
+    )
 
 
 def test_yfinance_provider_needs_two_closes():
     download = FakeDownload(yfinance_frame({"NEW": [100.0], "AAPL": [100.0, 101.0]}))
 
-    assert YFinanceProvider(download=download).get_daily_pnls(["NEW", "AAPL"])["NEW"] is None
+    assert YFinanceProvider(download=download, market_hours=CLOSED).get_daily_pnls(["NEW", "AAPL"])["NEW"] is None
 
 
 def test_yfinance_provider_raises_when_nothing_comes_back():
@@ -349,7 +366,7 @@ def test_yfinance_provider_raises_when_nothing_comes_back():
     download = FakeDownload(yfinance_frame({"AAPL": [None, None], "KO": [None, None]}))
 
     with pytest.raises(RuntimeError, match="no data for any of 2 ticker"):
-        YFinanceProvider(download=download).get_daily_pnls(["AAPL", "KO"])
+        YFinanceProvider(download=download, market_hours=CLOSED).get_daily_pnls(["AAPL", "KO"])
 
 
 def test_yfinance_provider_handles_a_single_ticker_frame_without_grouping():
@@ -358,13 +375,59 @@ def test_yfinance_provider_handles_a_single_ticker_frame_without_grouping():
         {"Close": [100.0, 103.0], "Volume": [1.0, 1.0]}, index=pd.date_range("2026-11-03", periods=2, freq="B")
     )
 
-    assert YFinanceProvider(download=FakeDownload(frame)).get_daily_pnls(["AAPL"])["AAPL"] == pytest.approx(0.03)
+    assert YFinanceProvider(download=FakeDownload(frame), market_hours=CLOSED).get_daily_pnls(["AAPL"])[
+        "AAPL"
+    ] == pytest.approx(0.03)
+
+
+# yfinance_frame dates its bars 2026-10-29, 2026-10-30, 2026-11-02, ...
+
+
+def test_during_a_session_the_newest_bar_counts_when_it_is_todays():
+    download = FakeDownload(yfinance_frame({"AAPL": [100.0, 100.0, 108.0]}))
+    provider = YFinanceProvider(download=download, market_hours=FixedSession(date(2026, 11, 2)))
+
+    assert provider.get_daily_pnls(["AAPL"])["AAPL"] == pytest.approx(0.08)
+
+
+def test_during_a_session_yesterdays_move_is_not_reported_as_todays():
+    """The first poll runs at 09:30:00, before Yahoo has a bar for the new session."""
+    download = FakeDownload(yfinance_frame({"AAPL": [100.0, 100.0, 108.0], "KO": [50.0, 50.0, 50.5]}))
+    provider = YFinanceProvider(download=download, market_hours=FixedSession(date(2026, 11, 3)))
+
+    assert provider.get_daily_pnls(["AAPL", "KO"]) == {"AAPL": None, "KO": None}  # not yet: no failure either
+
+
+def test_during_a_session_a_ticker_without_a_close_today_is_skipped():
+    download = FakeDownload(yfinance_frame({"AAPL": [100.0, 100.0, 108.0], "KO": [50.0, 55.0, None]}))
+    provider = YFinanceProvider(download=download, market_hours=FixedSession(date(2026, 11, 2)))
+
+    result = provider.get_daily_pnls(["AAPL", "KO"])
+
+    assert result["AAPL"] == pytest.approx(0.08)
+    assert result["KO"] is None  # 50 -> 55 was the previous session
+
+
+def test_during_a_session_an_empty_download_is_still_a_failure():
+    download = FakeDownload(yfinance_frame({"AAPL": [None, None], "KO": [None, None]}))
+    provider = YFinanceProvider(download=download, market_hours=FixedSession(date(2026, 11, 2)))
+
+    with pytest.raises(RuntimeError, match="no data for any of 2 ticker"):
+        provider.get_daily_pnls(["AAPL", "KO"])
+
+
+def test_outside_a_session_the_newest_bar_is_reported():
+    download = FakeDownload(yfinance_frame({"AAPL": [100.0, 100.0, 108.0]}))
+
+    assert YFinanceProvider(download=download, market_hours=CLOSED).get_daily_pnls(["AAPL"])["AAPL"] == pytest.approx(
+        0.08
+    )
 
 
 def test_yfinance_provider_does_not_download_without_tickers():
     download = FakeDownload(None)
 
-    assert YFinanceProvider(download=download).get_daily_pnls([]) == {}
+    assert YFinanceProvider(download=download, market_hours=CLOSED).get_daily_pnls([]) == {}
     assert download.calls == []
 
 

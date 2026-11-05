@@ -10,8 +10,9 @@ state, then extended with the Interactive Brokers integration it always promised
 
 ### Added
 - `MarketDataProvider` abstraction with two Yahoo Finance providers (`yfinance`, the
-  default, fetches the whole universe in one batched download; `yahoofinancials` is kept
-  as a fallback) and an **Interactive Brokers provider** (`MARKET_DATA_PROVIDER=ibkr`, built on `ib_async`, optional
+  default, fetches the whole universe in one batched download and never reads an earlier
+  session's bar as today's move; `yahoofinancials` is kept as a fallback) and an
+  **Interactive Brokers provider** (`MARKET_DATA_PROVIDER=ibkr`, built on `ib_async`, optional
   `ibkr` extra).
 - **Market-hours gating**: polling only during NYSE sessions (holidays and early
   closes computed from the published rules), with a configurable warm-up before
@@ -24,16 +25,19 @@ state, then extended with the Interactive Brokers integration it always promised
 - **Experimental, off-by-default order placement** on IBKR: at-the-money straddle
   combo orders staged in TWS for manual transmit, paper accounts only, long
   straddles only, with premium / notional / per-day caps and a dry-run mode.
-- **Position management** for the trader: fill tracking, take-profit / stop-loss /
-  end-of-day exits, daily loss limit, risk-based sizing, and a book reconciled with IB
-  after a restart or a lost connection.
+- **Position management** for the trader: fill tracking including partial fills and
+  rejections, take-profit / stop-loss / end-of-day exits that follow the market until
+  they fill, daily loss limit, risk-based sizing, and a book reconciled with IB after a
+  restart or a lost connection, before anything acts on it: an earlier run's straddles
+  and working orders are adopted, and the day's order cap, realized P&L and loss halt
+  are rebuilt from IB.
 - `market_watcher_cli doctor`: checks settings, target stocks, market hours, the data
   source, Slack, email and the TWS connection before `start`.
 - Trade events and an end-of-day summary are sent through the Slack / email
   notifiers (`SLACK_TRADING_WEBHOOK` optionally routes them to their own channel).
 - Optional rotating log file (`LOG_FILE`); `config` prints the whole effective
   configuration with secrets masked.
-- CI builds the Docker image; tests grew from 1 to over 250.
+- CI builds the Docker image; tests grew from 1 to over 330.
 
 ### Changed
 - Packaging moved to `pyproject.toml`; Python 3.10+ required; `ruff` replaces

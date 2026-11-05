@@ -1,3 +1,4 @@
+import logging
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -81,6 +82,17 @@ def test_requests_every_target_ticker_from_the_provider():
     engine.process_latest_market_movements()
 
     assert engine.data_provider.requested == [["ABEO", "ACRX", "TPCO", "TTMI"]]
+
+
+def test_tickers_without_data_are_logged_together_and_once(caplog):
+    engine = make_engine({"ABEO": None, "ACRX": None, "TPCO": 0.3, "TTMI": 0.6})
+
+    with caplog.at_level(logging.WARNING, logger="market_watcher.common"):
+        engine.process_latest_market_movements()
+        engine.process_latest_market_movements()
+
+    [record] = [record for record in caplog.records if "No daily P&L" in record.getMessage()]
+    assert "ABEO, ACRX" in record.getMessage()
 
 
 def test_reports_stocks_beyond_their_thresholds():

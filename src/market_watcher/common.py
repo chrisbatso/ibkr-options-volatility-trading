@@ -237,18 +237,25 @@ class MarketWatcherEngine:
         self.daily_pnls = self.data_provider.get_daily_pnls(tickers)
 
         investment_opportunities = []
+        newly_unavailable = []
         for ticker in tickers:
             settings = self.target_stocks[ticker]
             daily_pnl = self.daily_pnls.get(ticker)
             if daily_pnl is None:
                 if ticker not in self._unavailable:
-                    logger.warning("No daily P&L available for %s; skipping it until data is available", ticker)
+                    newly_unavailable.append(ticker)
                     self._unavailable.add(ticker)
                 continue
             self._unavailable.discard(ticker)
 
             if self.is_investment_opportunity(settings["strategy"], abs(daily_pnl)):
                 investment_opportunities.append(ticker)
+
+        if newly_unavailable:
+            # One line: right after the open the whole list can be waiting for its first bar of the session.
+            logger.warning(
+                "No daily P&L available for %s; skipping until data is available", ", ".join(newly_unavailable)
+            )
 
         investment_data = self.get_investment_data(investment_opportunities)
         new_investment_data = self._new_opportunities(investment_data)

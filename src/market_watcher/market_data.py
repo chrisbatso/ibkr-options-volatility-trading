@@ -10,10 +10,12 @@ import logging
 import math
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
+from datetime import datetime, timezone
 
 from yahoofinancials import YahooFinancials
 
 from market_watcher.config import config_int, context
+from market_watcher.market_hours import USMarketHours
 
 logger = logging.getLogger(__name__)
 
@@ -68,14 +70,18 @@ class YFinanceProvider(MarketDataProvider):
     """Daily P&L from Yahoo Finance through ``yfinance``: the whole universe in one batched download per cycle.
 
     The change is the last close over the previous close of the split/dividend-adjusted
-    daily bars. During the session the last bar is today's, still forming, so this is the
-    live move; before the open it is the previous session's move, like Yahoo's own quote.
+    daily bars. During a session the last bar is today's, still forming, so this is the
+    live move; a ticker with no bar for today yet (the first poll runs at the open) has no
+    figure, because the bar it does have is yesterday's move. Outside sessions the newest
+    bar is reported, like Yahoo's own quote.
     """
 
     name = "yfinance"
 
-    def __init__(self, download=None):
+    def __init__(self, download=None, market_hours=None, clock=None):
         self._download = download
+        self._market_hours = market_hours if market_hours is not None else USMarketHours()
+        self._clock = clock if clock is not None else (lambda: datetime.now(timezone.utc))
         quiet_yfinance_logging()
 
     def get_daily_pnls(self, tickers):
@@ -93,14 +99,16 @@ class YFinanceProvider(MarketDataProvider):
         data = self._download(
             tickers, period="5d", interval="1d", group_by="ticker", auto_adjust=True, threads=True, progress=False
         )
-        result = {ticker: _daily_change(_closes(data, ticker)) for ticker in tickers}
-        if all(value is None for value in result.values()):
+        closes = {ticker: _closes(data, ticker) for ticker in tickers}
+        if all(len(series) < 2 for series in closes.values()):
             # yfinance swallows network errors and returns an empty frame; make that a loud, retried failure.
             raise RuntimeError(
                 f"yfinance returned no data for any of {len(tickers)} ticker(s): network problem, Yahoo rate limit, "
                 "or every ticker unknown"
             )
-        return result
+        session = self._market_hours.current_session(self._clock())
+        session_day = session.day if session is not None else None
+        return {ticker: _daily_change(series, session_day) for ticker, series in closes.items()}
 
 
 def quiet_yfinance_logging():
@@ -109,20 +117,26 @@ def quiet_yfinance_logging():
 
 
 def _closes(data, ticker):
-    """Valid closes of ``ticker`` (oldest first) from a yfinance download, whether grouped by ticker or not."""
+    """Valid closes of ``ticker`` as a dated series (oldest first), from a download grouped by ticker or not."""
     grouped = hasattr(data.columns, "levels")  # a MultiIndex: (ticker, field)
     try:
         frame = data[ticker] if grouped else data
         series = frame["Close"]
     except KeyError:
         return []
-    return [float(value) for value in series.dropna()]
+    return series.dropna()
 
 
-def _daily_change(closes):
-    if len(closes) < 2 or closes[-2] <= 0:
+def _daily_change(closes, session_day=None):
+    """The newest close over the one before it; None when, during session ``session_day``, the newest is not today's."""
+    if len(closes) < 2:
         return None
-    return (closes[-1] - closes[-2]) / closes[-2]
+    if session_day is not None and closes.index[-1].date() != session_day:
+        return None
+    previous, latest = float(closes.iloc[-2]), float(closes.iloc[-1])
+    if previous <= 0:
+        return None
+    return (latest - previous) / previous
 
 
 class IBKRProvider(MarketDataProvider):
