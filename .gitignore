@@ -2,7 +2,7 @@
 .venv
 
 # Python files
-.pyc
+*.pyc
 __pycache__
 __pycache__/*
 *.egg-info
@@ -24,5 +24,9 @@ log.*
 # PyCharm files
 .idea
 
-# Pytest
+# The trader's record of a run
+trading_journal*.csv
+
+# Pytest / ruff caches
 .pytest_cache
+.ruff_cache

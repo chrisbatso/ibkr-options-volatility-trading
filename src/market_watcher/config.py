@@ -1,57 +1,60 @@
 import os
-import json
-from dataclasses import dataclass
-from typing import Any, Dict
+from dataclasses import dataclass, field
+from typing import Any
 
 from dotenv import dotenv_values
 
 
 @dataclass
 class Context:
-    """Global context for MarketWatcher trading bot."""
+    """Global context for the MarketWatcher trading bot."""
 
-    # Config from environment variables
-    config: Dict[str, Any] = None
-
-    # MarketWatcher state path
-    state_path: str = ""
-
-    @property
-    def state(self) -> Dict[str, Any]:
-        """Returns entire state object from json file."""
-        with open(self.state_path, "r") as f:
-            state = json.load(f)
-            return state
-
-    @property
-    def running(self) -> bool:
-        """Reads and returns running flag from state json."""
-        with open(self.state_path, "r") as f:
-            state = json.load(f)
-            return state["running"]
-
-    @running.setter
-    def running(self, new_state: bool) -> None:
-        """Sets the running flag in the state json."""
-
-        old_state = self.state
-
-        # Check if state needs updating
-        if old_state["running"] == new_state:
-            state = "running" if new_state else "stopped"
-            raise ValueError(f"MarketWatcher bot is already {state}.")
-
-        # Store new running flag value to state json file
-        with open(self.state_path, "w") as f:
-            old_state["running"] = new_state
-            json.dump(obj=old_state, fp=f)
+    # Configuration from the .env file in the working directory, overridden by environment variables.
+    config: dict[str, Any] = field(default_factory=dict)
 
 
-# Environment variable settings from .env files
 config = {
-    **dotenv_values(".env"),  # load shared development variables
-    **os.environ,  # override loaded values with environment variables
+    **dotenv_values(".env"),  # shared development variables
+    **os.environ,  # environment variables take precedence
 }
 
+context = Context(config=config)
 
-context = Context(config=config, state_path=r"src/market_watcher/state.json")
+
+_TRUE_VALUES = {"1", "true", "yes", "on"}
+_FALSE_VALUES = {"0", "false", "no", "off"}
+
+
+def config_flag(key, default):
+    """Returns a boolean configuration value (true/false, yes/no, on/off, 1/0), or ``default`` when it is unset."""
+    value = context.config.get(key)
+    if value is None or not value.strip():
+        return default
+    normalized = value.strip().lower()
+    if normalized in _TRUE_VALUES:
+        return True
+    if normalized in _FALSE_VALUES:
+        return False
+    raise ValueError(f"Configuration value {key}={value!r} is not a boolean; use true or false")
+
+
+def config_int(key, default):
+    """Returns an integer configuration value, or ``default`` when it is unset."""
+    value = context.config.get(key)
+    if value is None or not value.strip():
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        raise ValueError(f"Configuration value {key}={value!r} is not an integer") from None
+
+
+def config_float(key, default):
+    """Returns a numeric configuration value as a float, or ``default`` when it is unset."""
+    value = context.config.get(key)
+    if value is None or not value.strip():
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        raise ValueError(f"Configuration value {key}={value!r} is not a number") from None

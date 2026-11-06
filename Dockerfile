@@ -1,25 +1,13 @@
-FROM python:3.8-slim
+FROM python:3.12-slim
 
-# Setting working directory
 WORKDIR /app
 
-# Copying requirements before other files for faster sequential builds
-COPY requirements.txt ./
-
-# Installing 3rd party python requirements
-RUN pip install --no-cache-dir -r requirements.txt
-
-# Copying the source code
+# Install the package in editable mode so the CLI's relative default path
+# (src/market_watcher/research/target_stocks.yaml) resolves against /app
+# exactly as it does in a local checkout.
+# Configuration (.env) is deliberately excluded via .dockerignore and must be
+# supplied at runtime (see env_file in docker-compose.yaml).
 COPY . .
-
-# Installing IBRK Python API client
-RUN cd src/market_watcher/ib_client && \
-    python setup.py bdist_wheel && \
-    cd ../../..
-RUN pip install src/market_watcher/ib_client/dist/ibapi-9.76.1-py3-none-any.whl
-
-
-# Installing market_watcher_cli tool 
-RUN pip install --editable src/.   
+RUN pip install --no-cache-dir -e ".[ibkr]"
 
 CMD ["bash"]

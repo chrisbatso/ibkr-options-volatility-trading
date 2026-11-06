@@ -1,0 +1,66 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "market_watcher"
+description = "MarketWatcher: alerts for long/short straddle opportunities on US equities (IBKR volatility trading)"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+dynamic = ["version"]
+dependencies = [
+    "click>=8.1",
+    "python-dotenv>=1.0",
+    "PyYAML>=6.0",
+    "slack-sdk>=3.27",
+    # IANA time zone data for zoneinfo on platforms without a system database (Windows, some containers).
+    "tzdata>=2024.1",
+    # Default market data provider (batched downloads) and the screen command.
+    "yfinance>=0.2.50",
+    # Fallback provider; 1.7 (previously pinned) predates Yahoo's 2023 cookie/crumb change and no longer returns data.
+    "yahoofinancials>=1.20",
+]
+
+[project.optional-dependencies]
+# Interactive Brokers market data (MARKET_DATA_PROVIDER=ibkr) through TWS / IB Gateway.
+ibkr = [
+    "ib_async>=1.0",
+]
+# Kept for older instructions: yfinance is now a core dependency, so this extra adds nothing.
+research = []
+dev = [
+    "pytest>=8",
+    "ruff>=0.8",
+    "ib_async>=1.0",
+]
+
+[project.scripts]
+market_watcher_cli = "market_watcher.market_watcher_cli:cli"
+
+[tool.setuptools.dynamic]
+version = { attr = "market_watcher.version.VERSION" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+market_watcher = ["research/*.yaml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = [
+    "E",  # pycodestyle errors
+    "W",  # pycodestyle warnings
+    "F",  # pyflakes
+    "I",  # isort
+    "UP", # pyupgrade
+    "B",  # bugbear
+]
