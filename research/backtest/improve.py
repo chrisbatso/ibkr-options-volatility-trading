@@ -169,7 +169,7 @@ def interval(series, level=CONFIDENCE, draws=5000, seed=20261105):
 
 
 def run_null():
-    E.MAX_PREMIUM = math.inf  # fake prices are high on purpose: the cap would remove every trade
+    E.MAX_PREMIUM = E.MAX_NOTIONAL = math.inf  # fake prices are high on purpose: the caps would remove most trades
     for label, ratio, expectation in (
         ("implied = true vol", 1.0, "gross indistinguishable from 0"),
         ("true vol 25% above implied", 1.25, "long gross clearly above 0"),

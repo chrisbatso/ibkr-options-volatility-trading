@@ -454,9 +454,27 @@ def synthetic_market(vol_ratio=1.0, days=500, names=40, seed=7, overnight_share=
     for day in calendar:
         week = day - timedelta(days=day.weekday())
         week_of[day] = week
-        lists[(week, "long")] = [(ticker, ticker) for ticker in tickers]
+        lists[(week, "long")] = lists[(week, "short")] = [(ticker, ticker) for ticker in tickers]
         fetched.update((week, ticker) for ticker in tickers)
     return Market(closes, calendar, lists, fetched, week_of, expiries, chains)
+
+
+def run_null_short():
+    global MAX_NOTIONAL
+    MAX_NOTIONAL = math.inf  # synthetic prices are high on purpose: the cap would remove most trades
+    print("Short side, synthetic controls through the same evaluator (gross, per-day means):")
+    for label, ratio, expectation in (
+        ("implied = true vol", 1.0, "must be indistinguishable from 0"),
+        ("true vol 25% above implied", 1.25, "must be clearly negative for a seller"),
+    ):
+        results = [run_next_close(synthetic_market(vol_ratio=ratio, seed=seed), "short")[0] for seed in (7, 8, 9)]
+        trades = pd.concat(results)
+        print(f" {label} ({expectation}); signal trades {trades.signal.sum()}:")
+        describe("every signal, gross", daily_series(trades[trades.signal], "gross"))
+        describe("no-signal days, gross", daily_series(trades[~trades.signal], "gross"))
+        print(f"  median round-trip cost {trades.cost.median():.1%}")
+        if ratio == 1.0:
+            describe("every signal, net (must be below 0)", daily_series(trades[trades.signal], "net"))
 
 
 def run_null():
@@ -580,6 +598,8 @@ def run_results(side):
 if __name__ == "__main__":
     command = sys.argv[1]
     chosen_side = sys.argv[2] if len(sys.argv) > 2 else "long"
-    {"null": lambda: run_null(), "power": lambda: run_power(chosen_side), "results": lambda: run_results(chosen_side)}[
-        command
-    ]()
+    {
+        "null": lambda: run_null_short() if chosen_side == "short" else run_null(),
+        "power": lambda: run_power(chosen_side),
+        "results": lambda: run_results(chosen_side),
+    }[command]()

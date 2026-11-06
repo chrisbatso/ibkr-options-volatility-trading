@@ -2,7 +2,7 @@
 
 Rules and pass/fail criteria are in `PLAN.md`, fixed before any option P&L was seen. Window: 5 June 2023 to 9 September
 2026. Reproduce with `evaluate.py null`, `evaluate.py power` and `evaluate.py results`. The raw output is in
-`data/results_long.txt`, which stays out of git.
+`data/results_long.txt`, which stays out of git. The short side, which also loses money, is in its own section at the end.
 
 ## Verdict, long side (the bot's default)
 
@@ -79,6 +79,10 @@ cost. Only 1.84% of trades cost under 3.58%.
   intrinsic fallback and gave -31%. That was fixed before any real result was read.
 - A crash in the bootstrap helper interrupted the first results run. The fix changed no calculation, and the numbers
   above come from the complete rerun.
+- **V5's null controls first ran with the $20,000 notional cap still on.** Fake prices start at $1,000, so the cap removed
+  most trades (36 a market). It was found while writing the short-side test, and the controls were rerun with it lifted,
+  giving about 1,500 trades a market in the noisy-quote control. Its result barely moved: +1.39% before costs became +1.45%,
+  with the standard error down from 2.40 to 0.83. The real-data results did not use these controls and are unchanged.
 
 ## Improvements tested
 
@@ -126,18 +130,19 @@ matches the published work (Goyal and Saretto, 2009):
 | 1.5 to 2.0 | +16.9% | +19.6% |
 | 2.0 and up | +21.5% | +29.1% |
 
-Selling quote errors does not explain this: in a fake market with no edge and noisy, wide quotes, V5 reports +1.39%
-before costs (standard error 2.40) and -12.9% at the bid. It remains a lead on the thin options where it is hardest to
-collect. The next test, already fixed in the addendum to `PLAN_IMPROVEMENTS.md`, asks whether it survives at the bid on
-the more liquid short list.
+Selling quote errors does not explain this: in a fake market with no edge and noisy, wide quotes, V5 reports +1.45%
+before costs (standard error 0.83) and -12.2% at the bid. It remains a lead on the thin options where it is hardest to
+collect. The next test, fixed in the addendum to `PLAN_IMPROVEMENTS.md`, asked whether it survives at the bid on the short
+list. It does not: see the short side below.
 
 ### Null controls for the candidates
 
 The first run reported +2.47% before costs for V2 in a no-edge market, with an interval excluding zero. It used two fake
 markets. Across 24 fresh ones V2 averages +0.56% (standard error 0.34), and single markets range from -1.8% to +6.0%, so
-that was chance. All five are consistent with zero across those markets, though V5's control has few trades (36 a
-market), and the noisy-quote control above is the stronger test of it. It also shows the bootstrap interval can run about
-30% narrow on holds to expiry. V5's lower bound at mid -2% stays positive even after widening it by that much.
+that was chance. It also shows the bootstrap interval can run about 30% narrow on holds to expiry. V5's lower bound at
+mid -2% stays positive even after widening it by that much. V1 to V4 are consistent with zero across those markets. V5
+needed a rerun (see the deviations below) and reports -1.08% before costs (-9.05% to +6.22%) over 1,511 trades in two fake
+markets, also consistent with zero. The noisy-quote control above is still the stronger test of it.
 
 ### What changed in the bot
 
@@ -149,4 +154,93 @@ market), and the noisy-quote control above is the stronger test of it. It also s
 
 ## Short side
 
-Pending. Off by default, so secondary.
+**The frozen short rule loses money too, and selling rich vol failed its one test at the bid.** Neither direction works.
+Reproduce with `evaluate.py null short`, `evaluate.py power short`, `evaluate.py results short`, then `addendum.py null`,
+`addendum.py power` and `addendum.py results`. The raw output is in `data/results_short.txt`.
+
+### Frozen rule, Test A (next-close hold)
+
+| | Net of costs, per trade | Before costs, per trade | Rule in `PLAN.md` |
+|---|---|---|---|
+| **The bot's three a day** | **-32.8%** (95% interval -35.3% to -30.4%) | -1.04% (-2.19% to +0.05%) | Loses money in this form |
+
+In dollars, at one contract per trade: 2,057 trades, -$196,607 in total, about -$63,000 a year. **0 of 40 months made
+money.** The best month lost $1,532. 5.6% of days and 11.2% of trades made money.
+
+| Year | Net, per trade | Before costs, per trade | Median round-trip cost |
+|---|---|---|---|
+| 2023 (from June) | -26.8% | -1.36% | 12.7% |
+| 2024 | -30.2% | -1.40% | 13.6% |
+| 2025 | -32.0% | -0.12% | 19.6% |
+| 2026 (to September) | -43.3% | -1.57% | 32.0% |
+
+- **There is no premium to collect over one day.** Before costs the median trade makes 2.0% and 55.9% are up, the usual
+  shape for a seller, but the mean is about -1%.
+- **The signal adds nothing (C1).** Signal days minus no-signal days, same stock and week, before costs: -1.25% (-3.03% to
+  +0.43%).
+- **The spread decides the result.** Median round-trip cost is 17.4% of premium and the mean is 26.9%.
+- **The alphabet is arbitrary but harmless (C3).** Every signal in the downloaded names nets -32.7%.
+- **Tail:** worst trade -$1,359 (18.1% of notional), worst day -$1,416, mean of the worst 5% of days -$927. The window has
+  no crash, so these understate what naked options can lose.
+
+How far to trust it:
+
+- **Power:** the test can detect 3.10% of premium per trade, far less than the costs it measures.
+- **Null control:** on fake quotes with implied vol equal to true vol, gross is -0.12% (-0.43% to +0.19%). With true vol 25%
+  above implied, a seller's gross is -4.25% (-4.74% to -3.76%).
+- **Cost estimate:** end-of-day spreads may overstate real ones, and median cost nearly triples from 2023 to 2026, which
+  deserves suspicion. The verdict does not rest on it. With every spread halved, median cost is still about 10%, against
+  about zero before costs.
+- **Coverage:** on 267 of the 790 days the download ran out of names before reaching three picks, so those days have fewer
+  trades than the bot would have made. C3 suggests the missing names would not change the picture.
+- The limits listed for the long side also apply: the real intraday trade was not replayed, the window has no crash,
+  fills are assumed and the weekly refresh is an assumption. Test B is defined for the long side only.
+
+### Selling rich vol at the bid, the test fixed in the addendum
+
+| Period | Net at the bid, per trade (99% interval) | Before costs, per trade | Trades |
+|---|---|---|---|
+| 2023-24 | +5.0% (-7.3% to +19.3%) | +16.6% | 724 |
+| 2025-26 | **-19.7%** (-43.6% to -0.7%) | +0.4% | 411 |
+
+**It fails the rule**, which needs the 2025-26 interval entirely above 0. It does not earn a paper trial.
+
+- **It is not only the spread.** Before costs, 2025-26 is +0.4%. Fake markets with no edge report +2.9% to +4.1% after the
+  same selection on the bid, so this is no more than noise alone produces.
+- **The pattern from the long list does not carry over.** There, selling improved as implied got richer in both periods.
+  Here it does not, so the lead does not generalize across stocks:
+
+| Bid implied / trailing vol | 2023-24, before costs | 2025-26, before costs |
+|---|---|---|
+| Below 0.75 | -5.1% | -0.3% |
+| 0.75 to 1.0 | +5.1% | +10.5% |
+| 1.0 to 1.25 | -4.9% | +7.0% |
+| 1.25 to 1.5 | -6.2% | +11.4% |
+| 1.5 to 2.0 | +18.1% | -1.7% |
+| 2.0 and up | +9.7% | +14.3% |
+
+- **The list is tighter, not tight, which the addendum got wrong.** Median half-spread on these trades is 8.1%, against 13.7%
+  on the long list, and 27.2% of trades are under 5%. It rises from 6.4% in 2023-24 to 10.7% in 2025-26.
+- **In dollars:** total -$12,766. The 10 best trades made +$7,642 and the other 1,125 lost $20,408.
+- **There are fewer bets than trades.** 1,135 trades are 574 separate ticker-and-expiry bets. Counted once each, the net is
+  -2.5% and -12.2%.
+- **Tail:** worst trade -$2,063 (30.1% of notional, 4.5 times its premium), worst day -$2,186, mean of the worst 5% of days
+  -$1,260. 10.4% of trades lose more than their premium.
+
+How far to trust it:
+
+- **Null control:** with no edge, constant vol gives -2.7% net at the bid (standard error 2.5), and fair quotes with changing
+  vol give -9.2% (2.9) on thin options and -0.3% (2.0) on liquid ones. When selling really does pay (true vol 60% of implied),
+  it reports +38.4% (0.4).
+- **Hand check:** six random trades were rebuilt from the raw quote files and raw closes, and matched to the cent.
+- **Power is limited.** The 2025-26 half can detect about 15% of premium, so this does not rule out a small edge. The
+  bootstrap can also run about 30% narrow on holds to expiry, and widening by that much would take the interval across
+  zero. So the test shows this does not pass, not that it is certain to lose.
+- **Same window.** This is new evidence across stocks, not across time.
+
+### Where this leaves the strategy
+
+Both frozen rules lose money, with no edge before costs on either side. `PLAN_IMPROVEMENTS.md` says no further variants get
+tried on this window, and none will be. Selling rich vol stays an unproven lead on the long list only, and it holds there
+only at a fill of mid -2%, which real orders may not get. What could change this is new evidence: data after September
+2026, and real fills from the bot's journal on a paper account. Order placement should stay off for real money.

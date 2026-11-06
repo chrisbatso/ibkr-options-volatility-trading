@@ -79,7 +79,7 @@ def with_bid_columns(short):
 
 
 def run_null():
-    E.MAX_PREMIUM = math.inf
+    E.MAX_PREMIUM = E.MAX_NOTIONAL = math.inf  # fake prices are high on purpose: the caps would remove most trades
     rows = []
     for seed in range(301, 313):
         trades, _ = I.collect(noisy_market(seed))

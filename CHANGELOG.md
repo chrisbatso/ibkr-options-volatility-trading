@@ -38,7 +38,7 @@ state, then extended with the Interactive Brokers integration it always promised
 - Optional rotating log file (`LOG_FILE`); `config` prints the whole effective
   configuration with secrets masked.
 - A backtest of the frozen rules on real option quotes, with its method and limits, in
-  `research/backtest/`. Result: buying these straddles loses money.
+  `research/backtest/`. Result: buying or selling these straddles on the bot's rules loses money.
 - `STRADDLE_MAX_SPREAD_PCT` refuses straddles with wide spreads (default 6% of mid), and
   `TRADING_JOURNAL` records every order, fill and close with its quotes as CSV.
 - CI builds the Docker image; tests grew from 1 to over 340.
